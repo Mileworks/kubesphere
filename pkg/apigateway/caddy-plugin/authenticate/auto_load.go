@@ -19,18 +19,14 @@ package authenticate
 
 import (
 	"fmt"
-	"strings"
+	"kubesphere.io/kubesphere/pkg/apigateway/caddy-plugin/internal"
+	"kubesphere.io/kubesphere/pkg/simple/client/redis"
+	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
+	"time"
 
 	"github.com/mholt/caddy"
 	"github.com/mholt/caddy/caddyhttp/httpserver"
 )
-
-func init() {
-	caddy.RegisterPlugin("authenticate", caddy.Plugin{
-		ServerType: "http",
-		Action:     Setup,
-	})
-}
 
 func Setup(c *caddy.Controller) error {
 
@@ -41,8 +37,17 @@ func Setup(c *caddy.Controller) error {
 	}
 
 	c.OnStartup(func() error {
+		rule.RedisClient, err = redis.NewRedisClient(rule.RedisOptions, nil)
+		// ensure redis is connected  when startup
+		if err != nil {
+			return err
+		}
 		fmt.Println("Authenticate middleware is initiated")
 		return nil
+	})
+
+	c.OnShutdown(func() error {
+		return rule.RedisClient.Redis().Close()
 	})
 
 	httpserver.GetConfig(c).AddMiddleware(func(next httpserver.Handler) httpserver.Handler {
@@ -51,10 +56,11 @@ func Setup(c *caddy.Controller) error {
 
 	return nil
 }
-func parse(c *caddy.Controller) (Rule, error) {
 
-	rule := Rule{ExceptedPath: make([]string, 0)}
+func parse(c *caddy.Controller) (*Rule, error) {
 
+	rule := &Rule{}
+	rule.ExclusionRules = make([]internal.ExclusionRule, 0)
 	if c.Next() {
 		args := c.RemainingArgs()
 		switch len(args) {
@@ -63,47 +69,83 @@ func parse(c *caddy.Controller) (Rule, error) {
 				switch c.Val() {
 				case "path":
 					if !c.NextArg() {
-						return rule, c.ArgErr()
+						return nil, c.ArgErr()
 					}
 
 					rule.Path = c.Val()
 
 					if c.NextArg() {
-						return rule, c.ArgErr()
+						return nil, c.ArgErr()
+					}
+				case "token-idle-timeout":
+					if !c.NextArg() {
+						return nil, c.ArgErr()
+					}
+
+					if timeout, err := time.ParseDuration(c.Val()); err != nil {
+						return nil, c.ArgErr()
+					} else {
+						rule.TokenIdleTimeout = timeout
+					}
+
+					if c.NextArg() {
+						return nil, c.ArgErr()
+					}
+				case "redis-url":
+					if !c.NextArg() {
+						return nil, c.ArgErr()
+					}
+
+					options := &redis.RedisOptions{RedisURL: c.Val()}
+
+					if err := options.Validate(); len(err) > 0 {
+						return nil, c.ArgErr()
+					} else {
+						rule.RedisOptions = options
+					}
+
+					if c.NextArg() {
+						return nil, c.ArgErr()
 					}
 				case "secret":
 					if !c.NextArg() {
-						return rule, c.ArgErr()
+						return nil, c.ArgErr()
 					}
 
 					rule.Secret = []byte(c.Val())
 
 					if c.NextArg() {
-						return rule, c.ArgErr()
+						return nil, c.ArgErr()
 					}
 				case "except":
+
 					if !c.NextArg() {
-						return rule, c.ArgErr()
+						return nil, c.ArgErr()
 					}
 
-					rule.ExceptedPath = strings.Split(c.Val(), ",")
+					method := c.Val()
 
-					for i := 0; i < len(rule.ExceptedPath); i++ {
-						rule.ExceptedPath[i] = strings.TrimSpace(rule.ExceptedPath[i])
+					if !sliceutil.HasString(internal.HttpMethods, method) {
+						return nil, c.ArgErr()
 					}
 
-					if c.NextArg() {
-						return rule, c.ArgErr()
+					for c.NextArg() {
+						path := c.Val()
+						rule.ExclusionRules = append(rule.ExclusionRules, internal.ExclusionRule{Method: method, Path: path})
 					}
 				}
 			}
 		default:
-			return rule, c.ArgErr()
+			return nil, c.ArgErr()
 		}
 	}
 
 	if c.Next() {
-		return rule, c.ArgErr()
+		return nil, c.ArgErr()
+	}
+
+	if rule.RedisOptions == nil {
+		return nil, c.Err("redis-url must be specified")
 	}
 
 	return rule, nil

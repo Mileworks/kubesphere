@@ -19,21 +19,30 @@ package workloads
 
 import (
 	"fmt"
-	"kubesphere.io/kubesphere/pkg/simple/client/k8s"
+	"k8s.io/api/batch/v1"
+	k8serr "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/klog"
+	"kubesphere.io/kubesphere/pkg/simple/client"
 	"strings"
 	"time"
-
-	"github.com/golang/glog"
-	"k8s.io/api/batch/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 const retryTimes = 3
 
-func JobReRun(namespace, jobName string) error {
-	k8sClient := k8s.Client()
+func JobReRun(namespace, jobName, resourceVersion string) error {
+	k8sClient := client.ClientSets().K8s().Kubernetes()
 	job, err := k8sClient.BatchV1().Jobs(namespace).Get(jobName, metav1.GetOptions{})
 	if err != nil {
+		return err
+	}
+	// do not rerun job if resourceVersion not match
+	if job.GetObjectMeta().GetResourceVersion() != resourceVersion {
+		err := k8serr.NewConflict(schema.GroupResource{
+			Group: job.GetObjectKind().GroupVersionKind().Group, Resource: "job",
+		}, jobName, fmt.Errorf("please apply your changes to the latest version and try again"))
+		klog.Warning(err)
 		return err
 	}
 
@@ -49,7 +58,7 @@ func JobReRun(namespace, jobName string) error {
 	err = deleteJob(namespace, jobName)
 
 	if err != nil {
-		glog.Errorf("failed to rerun job %s, reason: %s", jobName, err)
+		klog.Errorf("failed to rerun job %s, reason: %s", jobName, err)
 		return fmt.Errorf("failed to rerun job %s", jobName)
 	}
 
@@ -63,7 +72,7 @@ func JobReRun(namespace, jobName string) error {
 	}
 
 	if err != nil {
-		glog.Errorf("failed to rerun job %s, reason: %s", jobName, err)
+		klog.Errorf("failed to rerun job %s, reason: %s", jobName, err)
 		return fmt.Errorf("failed to rerun job %s", jobName)
 	}
 
@@ -71,7 +80,7 @@ func JobReRun(namespace, jobName string) error {
 }
 
 func deleteJob(namespace, job string) error {
-	k8sClient := k8s.Client()
+	k8sClient := client.ClientSets().K8s().Kubernetes()
 	deletePolicy := metav1.DeletePropagationBackground
 	err := k8sClient.BatchV1().Jobs(namespace).Delete(job, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
 	return err

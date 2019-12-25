@@ -39,27 +39,31 @@ define ALL_HELP_INFO
 #           debugging tools like delve.
 endef
 .PHONY: all
-all: test ks-apiserver ks-apigateway ks-iam controller-manager clientset
+all: test hypersphere ks-apiserver ks-apigateway ks-iam controller-manager
 
 # Build ks-apiserver binary
-ks-apiserver: test
+ks-apiserver: fmt vet
 	hack/gobuild.sh cmd/ks-apiserver
 
 # Build ks-apigateway binary
-ks-apigateway: test
+ks-apigateway: fmt vet
 	hack/gobuild.sh cmd/ks-apigateway
 
 # Build ks-iam binary
-ks-iam: test
+ks-iam: fmt vet
 	hack/gobuild.sh cmd/ks-iam
 
 # Build controller-manager binary
-controller-manager: test
+controller-manager: fmt vet
 	hack/gobuild.sh cmd/controller-manager
+
+# Build hypersphere binary
+hypersphere: fmt vet
+	hack/gobuild.sh cmd/hypersphere
 
 # Run go fmt against code 
 fmt: generate
-	go fmt ./pkg/... ./cmd/...
+	gofmt -w ./pkg ./cmd ./tools ./api
 
 # Run go vet against code
 vet: generate
@@ -76,16 +80,25 @@ deploy: manifests
 # generate will generate crds' deepcopy & go openapi structs
 # Futher more about go:genreate . https://blog.golang.org/generate
 generate:
-	GO111MODULE=on go install -mod=vendor k8s.io/code-generator/cmd/deepcopy-gen
 	go generate ./pkg/... ./cmd/...
 
+deepcopy:
+	GO111MODULE=on go install -mod=vendor k8s.io/code-generator/cmd/deepcopy-gen
+	${GOPATH}/bin/deepcopy-gen -i kubesphere.io/kubesphere/pkg/apis/... -h ./hack/boilerplate.go.txt -O zz_generated.deepcopy
+
+openapi:
+	go run ./vendor/k8s.io/kube-openapi/cmd/openapi-gen/openapi-gen.go -O openapi_generated -i ./vendor/k8s.io/apimachinery/pkg/apis/meta/v1,./pkg/apis/tenant/v1alpha1 -p kubesphere.io/kubesphere/pkg/apis/tenant/v1alpha1 -h ./hack/boilerplate.go.txt --report-filename ./api/api-rules/violation_exceptions.list
+	go run ./vendor/k8s.io/kube-openapi/cmd/openapi-gen/openapi-gen.go -O openapi_generated -i ./vendor/k8s.io/apimachinery/pkg/apis/meta/v1,./pkg/apis/servicemesh/v1alpha2 -p kubesphere.io/kubesphere/pkg/apis/servicemesh/v1alpha2 -h ./hack/boilerplate.go.txt --report-filename ./api/api-rules/violation_exceptions.list
+	go run ./vendor/k8s.io/kube-openapi/cmd/openapi-gen/openapi-gen.go -O openapi_generated -i ./vendor/k8s.io/api/networking/v1,./vendor/k8s.io/apimachinery/pkg/apis/meta/v1,./pkg/apis/network/v1alpha1 -p kubesphere.io/kubesphere/pkg/apis/network/v1alpha1 -h ./hack/boilerplate.go.txt --report-filename ./api/api-rules/violation_exceptions.list
+	go run ./vendor/k8s.io/kube-openapi/cmd/openapi-gen/openapi-gen.go -O openapi_generated -i ./vendor/k8s.io/apimachinery/pkg/apis/meta/v1,./pkg/apis/devops/v1alpha1 -p kubesphere.io/kubesphere/pkg/apis/devops/v1alpha1 -h ./hack/boilerplate.go.txt --report-filename ./api/api-rules/violation_exceptions.list
+	go run ./tools/cmd/crd-doc-gen/main.go
 # Build the docker image
 docker-build: all
 	docker build . -t ${IMG}
 
 # Run tests
 test: fmt vet
-	export KUBEBUILDER_CONTROLPLANE_START_TIMEOUT=1m; go test ./pkg/... ./cmd/... -coverprofile cover.out
+	export KUBEBUILDER_CONTROLPLANE_START_TIMEOUT=1m; go test ./pkg/... ./cmd/... -covermode=atomic -coverprofile=coverage.txt
 
 .PHONY: clean
 clean:
@@ -94,7 +107,7 @@ clean:
 
 # find or download controller-gen
 # download controller-gen if necessary
-clientset: generate
+clientset: 
 	./hack/generate_client.sh
 
 
@@ -106,7 +119,7 @@ internal-crds:
 	$(CONTROLLER_GEN) $(CRD_OPTIONS) rbac:roleName=manager-role webhook paths="./pkg/apis/network/..." output:crd:artifacts:config=config/crd/bases
 
 internal-generate-apis: internal-controller-gen
-	$(CONTROLLER_GEN) object:headerFile=./hack/boilerplate.go.txt paths=./pkg/apis/...
+	$(CONTROLLER_GEN) object:headerFile=./hack/boilerplate.go.txt paths=./pkg/apis/network/...
 
 internal-controller-gen:
 ifeq (, $(shell which controller-gen))
@@ -115,3 +128,7 @@ CONTROLLER_GEN=$(GOBIN)/controller-gen
 else
 CONTROLLER_GEN=$(shell which controller-gen)
 endif
+
+network-rbac:
+	$(CONTROLLER_GEN) paths=./pkg/controller/network/provider/ paths=./pkg/controller/network/ rbac:roleName=network-manager output:rbac:artifacts:config=kustomize/network/calico-k8s
+	$(CONTROLLER_GEN) paths=./pkg/controller/network/ rbac:roleName=network-manager output:rbac:artifacts:config=kustomize/network/calico-etcd

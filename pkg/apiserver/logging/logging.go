@@ -19,97 +19,59 @@
 package logging
 
 import (
+	"bytes"
+	"fmt"
 	"github.com/emicklei/go-restful"
-	"github.com/golang/glog"
-	"kubesphere.io/kubesphere/pkg/errors"
+	"io"
+	"k8s.io/klog"
+	"kubesphere.io/kubesphere/pkg/api/logging/v1alpha2"
 	"kubesphere.io/kubesphere/pkg/models/log"
-	es "kubesphere.io/kubesphere/pkg/simple/client/elasticsearch"
+	"kubesphere.io/kubesphere/pkg/server/errors"
+	cs "kubesphere.io/kubesphere/pkg/simple/client"
 	fb "kubesphere.io/kubesphere/pkg/simple/client/fluentbit"
+	"kubesphere.io/kubesphere/pkg/utils/stringutils"
 	"net/http"
 	"strconv"
+	"strings"
+	"time"
 )
 
 func LoggingQueryCluster(request *restful.Request, response *restful.Response) {
-	res := logQuery(log.QueryLevelCluster, request)
-
-	if res.Status != http.StatusOK {
-		response.WriteHeaderAndEntity(res.Status, errors.New(res.Error))
-		return
+	param := parseRequest(log.QueryLevelCluster, request)
+	if param.Operation == v1alpha2.OperationExport {
+		logExport(param, request, response)
+	} else {
+		logQuery(param, response)
 	}
-
-	response.WriteAsJson(res)
 }
 
 func LoggingQueryWorkspace(request *restful.Request, response *restful.Response) {
-	res := logQuery(log.QueryLevelWorkspace, request)
-
-	if res.Status != http.StatusOK {
-		response.WriteHeaderAndEntity(res.Status, errors.New(res.Error))
-		return
-	}
-
-	response.WriteAsJson(res)
+	param := parseRequest(log.QueryLevelWorkspace, request)
+	logQuery(param, response)
 }
 
 func LoggingQueryNamespace(request *restful.Request, response *restful.Response) {
-	res := logQuery(log.QueryLevelNamespace, request)
-
-	if res.Status != http.StatusOK {
-		response.WriteHeaderAndEntity(res.Status, errors.New(res.Error))
-		return
-	}
-
-	response.WriteAsJson(res)
+	param := parseRequest(log.QueryLevelNamespace, request)
+	logQuery(param, response)
 }
 
 func LoggingQueryWorkload(request *restful.Request, response *restful.Response) {
-	res := logQuery(log.QueryLevelWorkload, request)
-
-	if res.Status != http.StatusOK {
-		response.WriteHeaderAndEntity(res.Status, errors.New(res.Error))
-		return
-	}
-
-	response.WriteAsJson(res)
+	param := parseRequest(log.QueryLevelWorkload, request)
+	logQuery(param, response)
 }
 
 func LoggingQueryPod(request *restful.Request, response *restful.Response) {
-	res := logQuery(log.QueryLevelPod, request)
-	if res.Status != http.StatusOK {
-		response.WriteHeaderAndEntity(res.Status, errors.New(res.Error))
-		return
-	}
-	response.WriteAsJson(res)
+	param := parseRequest(log.QueryLevelPod, request)
+	logQuery(param, response)
 }
 
 func LoggingQueryContainer(request *restful.Request, response *restful.Response) {
-	res := logQuery(log.QueryLevelContainer, request)
-	if res.Status != http.StatusOK {
-		response.WriteHeaderAndEntity(res.Status, errors.New(res.Error))
-		return
-	}
-	response.WriteAsJson(res)
-}
-
-func LoggingQueryFluentbitFilters(request *restful.Request, response *restful.Response) {
-	res := log.FluentbitFiltersQuery()
-	response.WriteAsJson(res)
-}
-
-func LoggingUpdateFluentbitFilters(request *restful.Request, response *restful.Response) {
-
-	var res *log.FluentbitFiltersResult
-
-	filters := new([]log.FluentbitFilter)
-
-	err := request.ReadEntity(&filters)
-	if err != nil {
-		res = &log.FluentbitFiltersResult{Status: http.StatusBadRequest}
+	param := parseRequest(log.QueryLevelContainer, request)
+	if param.Operation == v1alpha2.OperationExport {
+		logExport(param, request, response)
 	} else {
-		res = log.FluentbitFiltersUpdate(filters)
+		logQuery(param, response)
 	}
-
-	response.WriteAsJson(res)
 }
 
 func LoggingQueryFluentbitOutputs(request *restful.Request, response *restful.Response) {
@@ -122,13 +84,12 @@ func LoggingQueryFluentbitOutputs(request *restful.Request, response *restful.Re
 }
 
 func LoggingInsertFluentbitOutput(request *restful.Request, response *restful.Response) {
-
 	var output fb.OutputPlugin
 	var res *log.FluentbitOutputsResult
 
 	err := request.ReadEntity(&output)
 	if err != nil {
-		glog.Errorln(err)
+		klog.Errorln(err)
 		response.WriteHeaderAndEntity(http.StatusBadRequest, errors.Wrap(err))
 		return
 	}
@@ -143,14 +104,13 @@ func LoggingInsertFluentbitOutput(request *restful.Request, response *restful.Re
 }
 
 func LoggingUpdateFluentbitOutput(request *restful.Request, response *restful.Response) {
-
 	var output fb.OutputPlugin
 
 	id := request.PathParameter("output")
 
 	err := request.ReadEntity(&output)
 	if err != nil {
-		glog.Errorln(err)
+		klog.Errorln(err)
 		response.WriteHeaderAndEntity(http.StatusBadRequest, errors.Wrap(err))
 		return
 	}
@@ -166,7 +126,6 @@ func LoggingUpdateFluentbitOutput(request *restful.Request, response *restful.Re
 }
 
 func LoggingDeleteFluentbitOutput(request *restful.Request, response *restful.Response) {
-
 	var res *log.FluentbitOutputsResult
 
 	id := request.PathParameter("output")
@@ -180,93 +139,168 @@ func LoggingDeleteFluentbitOutput(request *restful.Request, response *restful.Re
 	response.WriteAsJson(res)
 }
 
-func logQuery(level log.LogQueryLevel, request *restful.Request) *es.QueryResult {
-	var param es.QueryParameters
+func logQuery(param v1alpha2.QueryParameters, response *restful.Response) {
+	es, err := cs.ClientSets().ElasticSearch()
+	if err != nil {
+		response.WriteHeaderAndEntity(http.StatusServiceUnavailable, errors.Wrap(err))
+		return
+	}
 
-	param.Operation = request.QueryParameter("operation")
+	res, err := es.Query(param)
+	if err != nil {
+		response.WriteHeaderAndEntity(http.StatusInternalServerError, errors.Wrap(err))
+		return
+	}
+
+	response.WriteAsJson(res)
+}
+
+func logExport(param v1alpha2.QueryParameters, request *restful.Request, response *restful.Response) {
+	es, err := cs.ClientSets().ElasticSearch()
+	if err != nil {
+		response.WriteHeaderAndEntity(http.StatusServiceUnavailable, errors.Wrap(err))
+		return
+	}
+
+	response.Header().Set(restful.HEADER_ContentType, "text/plain")
+	response.Header().Set("Content-Disposition", "attachment")
+
+	// keep search context alive for 1m
+	param.ScrollTimeout = time.Minute
+	// export 1000 records in every iteration
+	param.Size = 1000
+	// from is not allowed in a scroll context
+	param.From = 0
+
+	var scrollId string
+	// limit to retrieve max 100k records
+	for i := 0; i < 100; i++ {
+		var res *v1alpha2.QueryResult
+		if scrollId == "" {
+			res, err = es.Query(param)
+			if err != nil {
+				response.WriteHeaderAndEntity(http.StatusInternalServerError, errors.Wrap(err))
+				return
+			}
+		} else {
+			res, err = es.Scroll(scrollId)
+			if err != nil {
+				break
+			}
+		}
+
+		if res.Read == nil || len(res.Read.Records) == 0 {
+			break
+		}
+		output := new(bytes.Buffer)
+		for _, r := range res.Read.Records {
+			output.WriteString(fmt.Sprintf(`%s`, stringutils.StripAnsi(r.Log)))
+		}
+		_, err = io.Copy(response, output)
+		if err != nil {
+			klog.Error(err)
+			break
+		}
+
+		scrollId = res.Read.ScrollID
+
+		select {
+		case <-request.Request.Context().Done():
+			break
+		default:
+		}
+	}
+
+	if scrollId != "" {
+		es.ClearScroll(scrollId)
+	}
+}
+
+func parseRequest(level log.LogQueryLevel, request *restful.Request) v1alpha2.QueryParameters {
+	var param v1alpha2.QueryParameters
 
 	switch level {
 	case log.QueryLevelCluster:
-		{
-			param.NamespaceFilled, param.Namespaces = log.QueryWorkspace(request.QueryParameter("workspaces"), request.QueryParameter("workspace_query"))
-			param.NamespaceFilled, param.Namespaces = log.MatchNamespace(request.QueryParameter("namespaces"), param.NamespaceFilled, param.Namespaces)
-			param.NamespaceFilled, param.NamespaceWithCreationTime = log.GetNamespaceCreationTimeMap(param.Namespaces)
-			param.NamespaceQuery = request.QueryParameter("namespace_query")
-			param.PodFilled, param.Pods = log.QueryWorkload(request.QueryParameter("workloads"), request.QueryParameter("workload_query"), param.Namespaces)
-			param.PodFilled, param.Pods = log.MatchPod(request.QueryParameter("pods"), param.PodFilled, param.Pods)
-			param.PodQuery = request.QueryParameter("pod_query")
-			param.ContainerFilled, param.Containers = log.MatchContainer(request.QueryParameter("containers"))
-			param.ContainerQuery = request.QueryParameter("container_query")
-		}
+		var namespaces []string
+		param.NamespaceNotFound, namespaces = log.MatchNamespace(stringutils.Split(request.QueryParameter("namespaces"), ","),
+			stringutils.Split(strings.ToLower(request.QueryParameter("namespace_query")), ","),
+			stringutils.Split(request.QueryParameter("workspaces"), ","),
+			stringutils.Split(strings.ToLower(request.QueryParameter("workspace_query")), ","))
+		param.NamespaceWithCreationTime = log.MakeNamespaceCreationTimeMap(namespaces)
+		param.WorkloadFilter = stringutils.Split(request.QueryParameter("workloads"), ",")
+		param.WorkloadQuery = stringutils.Split(request.QueryParameter("workload_query"), ",")
+		param.PodFilter = stringutils.Split(request.QueryParameter("pods"), ",")
+		param.PodQuery = stringutils.Split(request.QueryParameter("pod_query"), ",")
+		param.ContainerFilter = stringutils.Split(request.QueryParameter("containers"), ",")
+		param.ContainerQuery = stringutils.Split(request.QueryParameter("container_query"), ",")
 	case log.QueryLevelWorkspace:
-		{
-			param.NamespaceFilled, param.Namespaces = log.QueryWorkspace(request.PathParameter("workspace"), "")
-			param.NamespaceFilled, param.Namespaces = log.MatchNamespace(request.QueryParameter("namespaces"), param.NamespaceFilled, param.Namespaces)
-			param.NamespaceFilled, param.NamespaceWithCreationTime = log.GetNamespaceCreationTimeMap(param.Namespaces)
-			param.NamespaceQuery = request.QueryParameter("namespace_query")
-			param.PodFilled, param.Pods = log.QueryWorkload(request.QueryParameter("workloads"), request.QueryParameter("workload_query"), param.Namespaces)
-			param.PodFilled, param.Pods = log.MatchPod(request.QueryParameter("pods"), param.PodFilled, param.Pods)
-			param.PodQuery = request.QueryParameter("pod_query")
-			param.ContainerFilled, param.Containers = log.MatchContainer(request.QueryParameter("containers"))
-			param.ContainerQuery = request.QueryParameter("container_query")
-		}
+		var namespaces []string
+		param.NamespaceNotFound, namespaces = log.MatchNamespace(stringutils.Split(request.QueryParameter("namespaces"), ","),
+			stringutils.Split(strings.ToLower(request.QueryParameter("namespace_query")), ","),
+			stringutils.Split(request.PathParameter("workspace"), ","), nil)
+		param.NamespaceWithCreationTime = log.MakeNamespaceCreationTimeMap(namespaces)
+		param.WorkloadFilter = stringutils.Split(request.QueryParameter("workloads"), ",")
+		param.WorkloadQuery = stringutils.Split(request.QueryParameter("workload_query"), ",")
+		param.PodFilter = stringutils.Split(request.QueryParameter("pods"), ",")
+		param.PodQuery = stringutils.Split(request.QueryParameter("pod_query"), ",")
+		param.ContainerFilter = stringutils.Split(request.QueryParameter("containers"), ",")
+		param.ContainerQuery = stringutils.Split(request.QueryParameter("container_query"), ",")
 	case log.QueryLevelNamespace:
-		{
-			param.NamespaceFilled, param.Namespaces = log.MatchNamespace(request.PathParameter("namespace"), false, nil)
-			param.NamespaceFilled, param.NamespaceWithCreationTime = log.GetNamespaceCreationTimeMap(param.Namespaces)
-			param.PodFilled, param.Pods = log.QueryWorkload(request.QueryParameter("workloads"), request.QueryParameter("workload_query"), param.Namespaces)
-			param.PodFilled, param.Pods = log.MatchPod(request.QueryParameter("pods"), param.PodFilled, param.Pods)
-			param.PodQuery = request.QueryParameter("pod_query")
-			param.ContainerFilled, param.Containers = log.MatchContainer(request.QueryParameter("containers"))
-			param.ContainerQuery = request.QueryParameter("container_query")
-		}
+		namespaces := []string{request.PathParameter("namespace")}
+		param.NamespaceWithCreationTime = log.MakeNamespaceCreationTimeMap(namespaces)
+		param.WorkloadFilter = stringutils.Split(request.QueryParameter("workloads"), ",")
+		param.WorkloadQuery = stringutils.Split(request.QueryParameter("workload_query"), ",")
+		param.PodFilter = stringutils.Split(request.QueryParameter("pods"), ",")
+		param.PodQuery = stringutils.Split(request.QueryParameter("pod_query"), ",")
+		param.ContainerFilter = stringutils.Split(request.QueryParameter("containers"), ",")
+		param.ContainerQuery = stringutils.Split(request.QueryParameter("container_query"), ",")
 	case log.QueryLevelWorkload:
-		{
-			param.NamespaceFilled, param.Namespaces = log.MatchNamespace(request.PathParameter("namespace"), false, nil)
-			param.NamespaceFilled, param.NamespaceWithCreationTime = log.GetNamespaceCreationTimeMap(param.Namespaces)
-			param.PodFilled, param.Pods = log.QueryWorkload(request.PathParameter("workload"), "", param.Namespaces)
-			param.PodFilled, param.Pods = log.MatchPod(request.QueryParameter("pods"), param.PodFilled, param.Pods)
-			param.PodQuery = request.QueryParameter("pod_query")
-			param.ContainerFilled, param.Containers = log.MatchContainer(request.QueryParameter("containers"))
-			param.ContainerQuery = request.QueryParameter("container_query")
-		}
+		namespaces := []string{request.PathParameter("namespace")}
+		param.NamespaceWithCreationTime = log.MakeNamespaceCreationTimeMap(namespaces)
+		param.WorkloadFilter = []string{request.PathParameter("workload")}
+		param.PodFilter = stringutils.Split(request.QueryParameter("pods"), ",")
+		param.PodQuery = stringutils.Split(request.QueryParameter("pod_query"), ",")
+		param.ContainerFilter = stringutils.Split(request.QueryParameter("containers"), ",")
+		param.ContainerQuery = stringutils.Split(request.QueryParameter("container_query"), ",")
 	case log.QueryLevelPod:
-		{
-			param.NamespaceFilled, param.Namespaces = log.MatchNamespace(request.PathParameter("namespace"), false, nil)
-			param.NamespaceFilled, param.NamespaceWithCreationTime = log.GetNamespaceCreationTimeMap(param.Namespaces)
-			param.PodFilled, param.Pods = log.MatchPod(request.PathParameter("pod"), false, nil)
-			param.ContainerFilled, param.Containers = log.MatchContainer(request.QueryParameter("containers"))
-			param.ContainerQuery = request.QueryParameter("container_query")
-		}
+		namespaces := []string{request.PathParameter("namespace")}
+		param.NamespaceWithCreationTime = log.MakeNamespaceCreationTimeMap(namespaces)
+		param.PodFilter = []string{request.PathParameter("pod")}
+		param.ContainerFilter = stringutils.Split(request.QueryParameter("containers"), ",")
+		param.ContainerQuery = stringutils.Split(request.QueryParameter("container_query"), ",")
 	case log.QueryLevelContainer:
-		{
-			param.NamespaceFilled, param.Namespaces = log.MatchNamespace(request.PathParameter("namespace"), false, nil)
-			param.NamespaceFilled, param.NamespaceWithCreationTime = log.GetNamespaceCreationTimeMap(param.Namespaces)
-			param.PodFilled, param.Pods = log.MatchPod(request.PathParameter("pod"), false, nil)
-			param.ContainerFilled, param.Containers = log.MatchContainer(request.PathParameter("container"))
-		}
+		namespaces := []string{request.PathParameter("namespace")}
+		param.NamespaceWithCreationTime = log.MakeNamespaceCreationTimeMap(namespaces)
+		param.PodFilter = []string{request.PathParameter("pod")}
+		param.ContainerFilter = []string{request.PathParameter("container")}
 	}
 
-	if len(param.Namespaces) == 1 {
-		param.Workspace = log.GetWorkspaceOfNamesapce(param.Namespaces[0])
-	}
-
+	param.LogQuery = stringutils.Split(request.QueryParameter("log_query"), ",")
 	param.Interval = request.QueryParameter("interval")
-
-	param.LogQuery = request.QueryParameter("log_query")
 	param.StartTime = request.QueryParameter("start_time")
 	param.EndTime = request.QueryParameter("end_time")
 	param.Sort = request.QueryParameter("sort")
+	switch request.QueryParameter("operation") {
+	case "statistics":
+		param.Operation = v1alpha2.OperationStatistics
+	case "histogram":
+		param.Operation = v1alpha2.OperationHistogram
+	case "export":
+		param.Operation = v1alpha2.OperationExport
+	default:
+		param.Operation = v1alpha2.OperationQuery
+	}
 
 	var err error
 	param.From, err = strconv.ParseInt(request.QueryParameter("from"), 10, 64)
 	if err != nil {
 		param.From = 0
 	}
+
 	param.Size, err = strconv.ParseInt(request.QueryParameter("size"), 10, 64)
 	if err != nil {
 		param.Size = 10
 	}
 
-	return es.Query(param)
+	return param
 }

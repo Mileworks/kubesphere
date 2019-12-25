@@ -22,8 +22,6 @@ import (
 	"strings"
 
 	"k8s.io/api/core/v1"
-
-	prom "kubesphere.io/kubesphere/pkg/simple/client/prometheus"
 )
 
 func GetNamespacesWithMetrics(namespaces []*v1.Namespace) []*v1.Namespace {
@@ -34,31 +32,33 @@ func GetNamespacesWithMetrics(namespaces []*v1.Namespace) []*v1.Namespace {
 	nsFilter := "^(" + strings.Join(nsNameList, "|") + ")$"
 	var timeRelateParams = make(url.Values)
 
-	params := prom.MonitoringRequestParams{
+	params := RequestParams{
 		ResourcesFilter: nsFilter,
-		Params:          timeRelateParams,
-		QueryType:       prom.DefaultQueryType,
+		QueryParams:     timeRelateParams,
+		QueryType:       Query,
 		MetricsFilter:   "namespace_cpu_usage|namespace_memory_usage_wo_cache|namespace_pod_count",
 	}
 
-	rawMetrics := GetNamespaceLevelMetrics(&params)
+	rawMetrics := GetNamespaceMetrics(params)
+	if rawMetrics == nil {
+		return namespaces
+	}
 
 	for _, result := range rawMetrics.Results {
 		for _, data := range result.Data.Result {
-			metricDescMap, ok := data[ResultItemMetric].(map[string]interface{})
-			if ok {
-				if ns, exist := metricDescMap[ResultItemMetricResourceName]; exist {
-					timeAndValue, ok := data[ResultItemValue].([]interface{})
-					if ok && len(timeAndValue) == 2 {
-						for i := 0; i < len(namespaces); i++ {
-							if namespaces[i].Name == ns {
-								if namespaces[i].Annotations == nil {
-									namespaces[i].Annotations = make(map[string]string, 0)
-								}
-								namespaces[i].Annotations[result.MetricName] = timeAndValue[1].(string)
-							}
-						}
+
+			ns, exist := data.Metric["namespace"]
+
+			if !exist || len(data.Value) != 2 {
+				continue
+			}
+
+			for _, item := range namespaces {
+				if item.Name == ns {
+					if item.Annotations == nil {
+						item.Annotations = make(map[string]string, 0)
 					}
+					item.Annotations[result.MetricName] = data.Value[1].(string)
 				}
 			}
 		}

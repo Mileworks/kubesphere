@@ -1,45 +1,74 @@
 package options
 
 import (
-	"github.com/spf13/pflag"
-	genericoptions "kubesphere.io/kubesphere/pkg/options"
+	"flag"
+	cliflag "k8s.io/component-base/cli/flag"
+	"k8s.io/klog"
+	genericoptions "kubesphere.io/kubesphere/pkg/server/options"
+	"kubesphere.io/kubesphere/pkg/simple/client/devops"
+	esclient "kubesphere.io/kubesphere/pkg/simple/client/elasticsearch"
+	"kubesphere.io/kubesphere/pkg/simple/client/k8s"
+	"kubesphere.io/kubesphere/pkg/simple/client/mysql"
+	"kubesphere.io/kubesphere/pkg/simple/client/openpitrix"
+	"kubesphere.io/kubesphere/pkg/simple/client/prometheus"
+	"kubesphere.io/kubesphere/pkg/simple/client/s2is3"
+	"kubesphere.io/kubesphere/pkg/simple/client/servicemesh"
+	"kubesphere.io/kubesphere/pkg/simple/client/sonarqube"
+	"strings"
 )
 
 type ServerRunOptions struct {
 	GenericServerRunOptions *genericoptions.ServerRunOptions
 
-	// istio pilot discovery service url
-	IstioPilotServiceURL string
-
-	// jaeger query service url
-	JaegerQueryServiceUrl string
-
-	// prometheus service url for servicemesh metrics
-	ServicemeshPrometheusServiceUrl string
-
-	// openpitrix api gateway service url
-	OpenPitrixServer string
-
-	// openpitrix service token
-	OpenPitrixProxyToken string
+	KubernetesOptions  *k8s.KubernetesOptions
+	DevopsOptions      *devops.DevopsOptions
+	SonarQubeOptions   *sonarqube.SonarQubeOptions
+	ServiceMeshOptions *servicemesh.ServiceMeshOptions
+	MySQLOptions       *mysql.MySQLOptions
+	MonitoringOptions  *prometheus.PrometheusOptions
+	S3Options          *s2is3.S3Options
+	OpenPitrixOptions  *openpitrix.OpenPitrixOptions
+	LoggingOptions     *esclient.ElasticSearchOptions
 }
 
 func NewServerRunOptions() *ServerRunOptions {
 
 	s := ServerRunOptions{
 		GenericServerRunOptions: genericoptions.NewServerRunOptions(),
-		IstioPilotServiceURL:    "http://istio-pilot.istio-system.svc:8080/version",
-		JaegerQueryServiceUrl:   "http://jaeger-query.istio-system.svc:16686/jaeger",
+		KubernetesOptions:       k8s.NewKubernetesOptions(),
+		DevopsOptions:           devops.NewDevopsOptions(),
+		SonarQubeOptions:        sonarqube.NewSonarQubeOptions(),
+		ServiceMeshOptions:      servicemesh.NewServiceMeshOptions(),
+		MySQLOptions:            mysql.NewMySQLOptions(),
+		MonitoringOptions:       prometheus.NewPrometheusOptions(),
+		S3Options:               s2is3.NewS3Options(),
+		OpenPitrixOptions:       openpitrix.NewOpenPitrixOptions(),
+		LoggingOptions:          esclient.NewElasticSearchOptions(),
 	}
 
 	return &s
 }
 
-func (s *ServerRunOptions) AddFlags(fs *pflag.FlagSet) {
+func (s *ServerRunOptions) Flags() (fss cliflag.NamedFlagSets) {
 
-	s.GenericServerRunOptions.AddFlags(fs)
+	s.GenericServerRunOptions.AddFlags(fss.FlagSet("generic"))
+	s.KubernetesOptions.AddFlags(fss.FlagSet("kubernetes"))
+	s.MySQLOptions.AddFlags(fss.FlagSet("mysql"))
+	s.DevopsOptions.AddFlags(fss.FlagSet("devops"))
+	s.SonarQubeOptions.AddFlags(fss.FlagSet("sonarqube"))
+	s.S3Options.AddFlags(fss.FlagSet("s3"))
+	s.OpenPitrixOptions.AddFlags(fss.FlagSet("openpitrix"))
+	s.ServiceMeshOptions.AddFlags(fss.FlagSet("servicemesh"))
+	s.MonitoringOptions.AddFlags(fss.FlagSet("monitoring"))
+	s.LoggingOptions.AddFlags(fss.FlagSet("logging"))
 
-	fs.StringVar(&s.IstioPilotServiceURL, "istio-pilot-service-url", "http://istio-pilot.istio-system.svc:8080/version", "istio pilot discovery service url")
-	fs.StringVar(&s.JaegerQueryServiceUrl, "jaeger-query-service-url", "http://jaeger-query.istio-system.svc:16686/jaeger", "jaeger query service url")
-	fs.StringVar(&s.ServicemeshPrometheusServiceUrl, "servicemesh-prometheus-service-url", "http://prometheus-k8s-system.kubesphere-monitoring-system.svc:9090", "prometheus service for servicemesh")
+	fs := fss.FlagSet("klog")
+	local := flag.NewFlagSet("klog", flag.ExitOnError)
+	klog.InitFlags(local)
+	local.VisitAll(func(fl *flag.Flag) {
+		fl.Name = strings.Replace(fl.Name, "_", "-", -1)
+		fs.AddGoFlag(fl)
+	})
+
+	return fss
 }

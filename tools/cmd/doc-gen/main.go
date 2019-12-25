@@ -28,22 +28,24 @@ import (
 	"io/ioutil"
 	"kubesphere.io/kubesphere/pkg/apiserver/runtime"
 	"kubesphere.io/kubesphere/pkg/constants"
+	_ "kubesphere.io/kubesphere/pkg/kapis/servicemesh/metrics/install"
 	"log"
 	// Install apis
-	_ "kubesphere.io/kubesphere/pkg/apis/devops/install"
-	_ "kubesphere.io/kubesphere/pkg/apis/iam/install"
-	_ "kubesphere.io/kubesphere/pkg/apis/logging/install"
-	_ "kubesphere.io/kubesphere/pkg/apis/monitoring/install"
-	_ "kubesphere.io/kubesphere/pkg/apis/operations/install"
-	_ "kubesphere.io/kubesphere/pkg/apis/resources/install"
-	_ "kubesphere.io/kubesphere/pkg/apis/servicemesh/metrics/install"
-	_ "kubesphere.io/kubesphere/pkg/apis/tenant/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/devops/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/iam/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/logging/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/monitoring/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/openpitrix/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/operations/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/resources/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/tenant/install"
+	_ "kubesphere.io/kubesphere/pkg/kapis/terminal/install"
 )
 
 var output string
 
 func init() {
-	flag.StringVar(&output, "output", "./api.json", "--output=./api.json")
+	flag.StringVar(&output, "output", "./api/ks-openapi-spec/swagger.json", "--output=./api.json")
 }
 
 func main() {
@@ -86,7 +88,7 @@ func generateSwaggerJson() {
 		},
 		{
 			Name: "Other",
-			Tags: []string{constants.VerificationTag},
+			Tags: []string{constants.VerificationTag, constants.RegistryTag},
 		},
 		{
 			Name: "DevOps",
@@ -105,7 +107,7 @@ func generateSwaggerJson() {
 		},
 	})
 
-	data, _ := json.Marshal(swagger)
+	data, _ := json.MarshalIndent(swagger, "", "  ")
 	err := ioutil.WriteFile(output, data, 420)
 	if err != nil {
 		log.Fatal(err)

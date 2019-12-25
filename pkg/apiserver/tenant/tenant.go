@@ -19,24 +19,24 @@ package tenant
 
 import (
 	"github.com/emicklei/go-restful"
-	"github.com/golang/glog"
 	"k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	k8serr "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/util/net"
+	"k8s.io/klog"
+	devopsv1alpha2 "kubesphere.io/kubesphere/pkg/api/devops/v1alpha2"
+	loggingv1alpha2 "kubesphere.io/kubesphere/pkg/api/logging/v1alpha2"
 	"kubesphere.io/kubesphere/pkg/apis/tenant/v1alpha1"
 	"kubesphere.io/kubesphere/pkg/apiserver/logging"
 	"kubesphere.io/kubesphere/pkg/constants"
-	"kubesphere.io/kubesphere/pkg/errors"
-	"kubesphere.io/kubesphere/pkg/models/devops"
 	"kubesphere.io/kubesphere/pkg/models/iam"
 	"kubesphere.io/kubesphere/pkg/models/metrics"
 	"kubesphere.io/kubesphere/pkg/models/resources"
 	"kubesphere.io/kubesphere/pkg/models/tenant"
 	"kubesphere.io/kubesphere/pkg/models/workspaces"
-	"kubesphere.io/kubesphere/pkg/params"
+	"kubesphere.io/kubesphere/pkg/server/errors"
+	"kubesphere.io/kubesphere/pkg/server/params"
 
-	"kubesphere.io/kubesphere/pkg/simple/client/elasticsearch"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
 	"net/http"
 	"strings"
@@ -90,7 +90,7 @@ func DescribeWorkspace(req *restful.Request, resp *restful.Response) {
 	result, err := tenant.DescribeWorkspace(username, workspaceName)
 
 	if err != nil {
-		glog.Errorf("describe workspace failed: %+v", err)
+		klog.Errorf("describe workspace failed: %+v", err)
 		if k8serr.IsNotFound(err) {
 			resp.WriteHeaderAndEntity(http.StatusNotFound, errors.Wrap(err))
 		} else {
@@ -228,7 +228,7 @@ func ListDevopsProjects(req *restful.Request, resp *restful.Response) {
 	conditions, err := params.ParseConditions(req.QueryParameter(params.ConditionsParam))
 
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		errors.ParseSvcErr(restful.NewError(http.StatusBadRequest, err.Error()), resp)
 		return
 	}
@@ -236,7 +236,7 @@ func ListDevopsProjects(req *restful.Request, resp *restful.Response) {
 	result, err := tenant.ListDevopsProjects(workspace, username, conditions, orderBy, reverse, limit, offset)
 
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		errors.ParseSvcErr(err, resp)
 		return
 	}
@@ -244,6 +244,19 @@ func ListDevopsProjects(req *restful.Request, resp *restful.Response) {
 	resp.WriteAsJson(result)
 }
 
+func GetDevOpsProjectsCount(req *restful.Request, resp *restful.Response) {
+	username := req.HeaderParameter(constants.UserNameHeader)
+
+	result, err := tenant.GetDevOpsProjectsCount(username)
+	if err != nil {
+		klog.Errorf("%+v", err)
+		errors.ParseSvcErr(err, resp)
+		return
+	}
+	resp.WriteAsJson(struct {
+		Count uint32 `json:"count"`
+	}{Count: result})
+}
 func DeleteDevopsProject(req *restful.Request, resp *restful.Response) {
 	projectId := req.PathParameter("devops")
 	workspaceName := req.PathParameter("workspace")
@@ -252,7 +265,7 @@ func DeleteDevopsProject(req *restful.Request, resp *restful.Response) {
 	_, err := tenant.GetWorkspace(workspaceName)
 
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		errors.ParseSvcErr(restful.NewError(http.StatusBadRequest, err.Error()), resp)
 		return
 	}
@@ -260,7 +273,7 @@ func DeleteDevopsProject(req *restful.Request, resp *restful.Response) {
 	err = tenant.DeleteDevOpsProject(projectId, username)
 
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		errors.ParseSvcErr(err, resp)
 		return
 	}
@@ -273,21 +286,21 @@ func CreateDevopsProject(req *restful.Request, resp *restful.Response) {
 	workspaceName := req.PathParameter("workspace")
 	username := req.HeaderParameter(constants.UserNameHeader)
 
-	var devops devops.DevOpsProject
+	var devops devopsv1alpha2.DevOpsProject
 
 	err := req.ReadEntity(&devops)
 
 	if err != nil {
-		glog.Infof("%+v", err)
+		klog.Infof("%+v", err)
 		errors.ParseSvcErr(restful.NewError(http.StatusBadRequest, err.Error()), resp)
 		return
 	}
 
-	glog.Infoln("create workspace", username, workspaceName, devops)
+	klog.Infoln("create workspace", username, workspaceName, devops)
 	project, err := tenant.CreateDevopsProject(username, workspaceName, &devops)
 
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		errors.ParseSvcErr(err, resp)
 		return
 	}
@@ -317,7 +330,7 @@ func ListDevopsRules(req *restful.Request, resp *restful.Response) {
 	rules, err := tenant.GetUserDevopsSimpleRules(username, devops)
 
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		errors.ParseSvcErr(err, resp)
 		return
 	}
@@ -326,6 +339,26 @@ func ListDevopsRules(req *restful.Request, resp *restful.Response) {
 }
 
 func LogQuery(req *restful.Request, resp *restful.Response) {
+	operation := req.QueryParameter("operation")
+	req, err := regenerateLoggingRequest(req)
+	switch {
+	case err != nil:
+		resp.WriteHeaderAndEntity(http.StatusInternalServerError, errors.Wrap(err))
+	case req != nil:
+		logging.LoggingQueryCluster(req, resp)
+	default:
+		if operation == "export" {
+			resp.Header().Set(restful.HEADER_ContentType, "text/plain")
+			resp.Header().Set("Content-Disposition", "attachment")
+			resp.Write(nil)
+		} else {
+			resp.WriteAsJson(loggingv1alpha2.QueryResult{Read: new(loggingv1alpha2.ReadResult)})
+		}
+	}
+}
+
+// override namespace query conditions
+func regenerateLoggingRequest(req *restful.Request) (*restful.Request, error) {
 
 	username := req.HeaderParameter(constants.UserNameHeader)
 
@@ -335,9 +368,8 @@ func LogQuery(req *restful.Request, resp *restful.Response) {
 
 	clusterRules, err := iam.GetUserClusterRules(username)
 	if err != nil {
-		resp.WriteHeaderAndEntity(http.StatusInternalServerError, errors.Wrap(err))
-		glog.Errorln(err)
-		return
+		klog.Errorln(err)
+		return nil, err
 	}
 
 	hasClusterLogAccess := iam.RulesMatchesRequired(clusterRules, rbacv1.PolicyRule{Verbs: []string{"get"}, Resources: []string{"*"}, APIGroups: []string{"logging.kubesphere.io"}})
@@ -348,9 +380,8 @@ func LogQuery(req *restful.Request, resp *restful.Response) {
 		namespaces := make([]string, 0)
 		roles, err := iam.GetUserRoles("", username)
 		if err != nil {
-			resp.WriteHeaderAndEntity(http.StatusInternalServerError, errors.Wrap(err))
-			glog.Errorln(err)
-			return
+			klog.Errorln(err)
+			return nil, err
 		}
 		for _, role := range roles {
 			if !sliceutil.HasString(namespaces, role.Namespace) && iam.RulesMatchesRequired(role.Rules, rbacv1.PolicyRule{Verbs: []string{"get"}, Resources: []string{"*"}, APIGroups: []string{"logging.kubesphere.io"}}) {
@@ -361,17 +392,13 @@ func LogQuery(req *restful.Request, resp *restful.Response) {
 		// if the user belongs to no namespace
 		// then no log visible
 		if len(namespaces) == 0 {
-			res := esclient.QueryResult{Status: http.StatusOK}
-			resp.WriteAsJson(res)
-			return
+			return nil, nil
 		} else if len(queryNamespaces) == 1 && queryNamespaces[0] == "" {
 			values.Set("namespaces", strings.Join(namespaces, ","))
 		} else {
 			inter := intersection(queryNamespaces, namespaces)
 			if len(inter) == 0 {
-				res := esclient.QueryResult{Status: http.StatusOK}
-				resp.WriteAsJson(res)
-				return
+				return nil, nil
 			}
 			values.Set("namespaces", strings.Join(inter, ","))
 		}
@@ -381,7 +408,7 @@ func LogQuery(req *restful.Request, resp *restful.Response) {
 
 	// forward the request to logging model
 	newHttpRequest, _ := http.NewRequest(http.MethodGet, newUrl.String(), nil)
-	logging.LoggingQueryCluster(restful.NewRequest(newHttpRequest), resp)
+	return restful.NewRequest(newHttpRequest), nil
 }
 
 func intersection(s1, s2 []string) (inter []string) {

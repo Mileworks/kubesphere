@@ -19,9 +19,8 @@ package workspaces
 
 import (
 	"fmt"
-	"github.com/golang/glog"
-	"github.com/kiali/kiali/log"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/klog"
 	"kubesphere.io/kubesphere/pkg/constants"
 	"kubesphere.io/kubesphere/pkg/db"
 	"kubesphere.io/kubesphere/pkg/informers"
@@ -29,9 +28,8 @@ import (
 	"kubesphere.io/kubesphere/pkg/models/devops"
 	"kubesphere.io/kubesphere/pkg/models/iam"
 	"kubesphere.io/kubesphere/pkg/models/resources"
-	"kubesphere.io/kubesphere/pkg/params"
-	"kubesphere.io/kubesphere/pkg/simple/client/devops_mysql"
-	"kubesphere.io/kubesphere/pkg/simple/client/k8s"
+	"kubesphere.io/kubesphere/pkg/server/params"
+	clientset "kubesphere.io/kubesphere/pkg/simple/client"
 	"kubesphere.io/kubesphere/pkg/utils/k8sutil"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
 	"strings"
@@ -41,7 +39,7 @@ import (
 	"errors"
 	"k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 )
 
@@ -67,13 +65,13 @@ func Namespaces(workspaceName string) ([]*core.Namespace, error) {
 }
 
 func DeleteNamespace(workspace string, namespaceName string) error {
-	namespace, err := k8s.Client().CoreV1().Namespaces().Get(namespaceName, meta_v1.GetOptions{})
+	namespace, err := clientset.ClientSets().K8s().Kubernetes().CoreV1().Namespaces().Get(namespaceName, metav1.GetOptions{})
 	if err != nil {
 		return err
 	}
 	if namespace.Labels[constants.WorkspaceLabelKey] == workspace {
-		deletePolicy := meta_v1.DeletePropagationForeground
-		return k8s.Client().CoreV1().Namespaces().Delete(namespaceName, &meta_v1.DeleteOptions{PropagationPolicy: &deletePolicy})
+		deletePolicy := metav1.DeletePropagationBackground
+		return clientset.ClientSets().K8s().Kubernetes().CoreV1().Namespaces().Delete(namespaceName, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
 	} else {
 		return errors.New("resource not found")
 	}
@@ -96,7 +94,7 @@ func InviteUser(workspaceName string, user *models.User) error {
 	workspaceRole, err := iam.GetUserWorkspaceRole(workspaceName, user.Username)
 
 	if err != nil && !apierrors.IsNotFound(err) {
-		glog.Errorf("get workspace role failed: %+v", err)
+		klog.Errorf("get workspace role failed: %+v", err)
 		return err
 	}
 
@@ -109,7 +107,7 @@ func InviteUser(workspaceName string, user *models.User) error {
 	if currentWorkspaceRoleName != workspaceRoleName && currentWorkspaceRoleName != "" {
 		err := DeleteWorkspaceRoleBinding(workspaceName, user.Username, workspaceRole.Annotations[constants.DisplayNameAnnotationKey])
 		if err != nil {
-			glog.Errorf("delete workspace role binding failed: %+v", err)
+			klog.Errorf("delete workspace role binding failed: %+v", err)
 			return err
 		}
 	} else if currentWorkspaceRoleName != "" {
@@ -134,9 +132,9 @@ func CreateWorkspaceRoleBinding(workspace, username string, role string) error {
 	if !k8sutil.ContainsUser(workspaceRoleBinding.Subjects, username) {
 		workspaceRoleBinding = workspaceRoleBinding.DeepCopy()
 		workspaceRoleBinding.Subjects = append(workspaceRoleBinding.Subjects, v1.Subject{APIGroup: "rbac.authorization.k8s.io", Kind: "User", Name: username})
-		_, err = k8s.Client().RbacV1().ClusterRoleBindings().Update(workspaceRoleBinding)
+		_, err = clientset.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Update(workspaceRoleBinding)
 		if err != nil {
-			log.Errorf("update workspace role binding failed: %+v", err)
+			klog.Errorf("update workspace role binding failed: %+v", err)
 			return err
 		}
 	}
@@ -165,14 +163,21 @@ func DeleteWorkspaceRoleBinding(workspace, username string, role string) error {
 		}
 	}
 
-	workspaceRoleBinding, err = k8s.Client().RbacV1().ClusterRoleBindings().Update(workspaceRoleBinding)
+	workspaceRoleBinding, err = clientset.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Update(workspaceRoleBinding)
 
 	return err
 }
 
-func GetDevOpsProjects(workspaceName string) ([]string, error) {
+func GetDevOpsProjectsCount(workspaceName string) (int, error) {
+	_, err := clientset.ClientSets().Devops()
+	if _, notEnabled := err.(clientset.ClientSetNotEnabledError); notEnabled {
+		return 0, err
+	}
 
-	dbconn := devops_mysql.OpenDatabase()
+	dbconn, err := clientset.ClientSets().MySQL()
+	if err != nil {
+		return 0, err
+	}
 
 	query := dbconn.Select(devops.DevOpsProjectIdColumn).
 		From(devops.DevOpsProjectTableName).
@@ -182,9 +187,9 @@ func GetDevOpsProjects(workspaceName string) ([]string, error) {
 	devOpsProjects := make([]string, 0)
 
 	if _, err := query.Load(&devOpsProjects); err != nil {
-		return nil, err
+		return 0, err
 	}
-	return devOpsProjects, nil
+	return len(devOpsProjects), nil
 }
 
 func WorkspaceUserCount(workspace string) (int, error) {
@@ -195,24 +200,24 @@ func WorkspaceUserCount(workspace string) (int, error) {
 	return count, nil
 }
 
-func GetOrgRoles(name string) ([]string, error) {
-	return constants.WorkSpaceRoles, nil
+func GetOrgRolesCount(name string) (int, error) {
+	return len(constants.WorkSpaceRoles), nil
 }
 
-func WorkspaceNamespaces(workspaceName string) ([]string, error) {
+func WorkspaceNamespaceCount(workspaceName string) (int, error) {
 	ns, err := Namespaces(workspaceName)
 
 	namespaces := make([]string, 0)
 
 	if err != nil {
-		return namespaces, err
+		return 0, err
 	}
 
 	for i := 0; i < len(ns); i++ {
 		namespaces = append(namespaces, ns[i].Name)
 	}
 
-	return namespaces, nil
+	return len(namespaces), nil
 }
 
 func WorkspaceCount() (int, error) {
@@ -236,7 +241,15 @@ func GetAllProjectNums() (int, error) {
 }
 
 func GetAllDevOpsProjectsNums() (int, error) {
-	dbconn := devops_mysql.OpenDatabase()
+	_, err := clientset.ClientSets().Devops()
+	if _, notEnabled := err.(clientset.ClientSetNotEnabledError); notEnabled {
+		return 0, err
+	}
+
+	dbconn, err := clientset.ClientSets().MySQL()
+	if err != nil {
+		return 0, err
+	}
 
 	query := dbconn.Select(devops.DevOpsProjectIdColumn).
 		From(devops.DevOpsProjectTableName).

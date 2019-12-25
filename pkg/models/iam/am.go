@@ -20,25 +20,24 @@ package iam
 import (
 	"fmt"
 	"github.com/go-ldap/ldap"
-	"github.com/golang/glog"
 	rbacv1 "k8s.io/api/rbac/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/klog"
 	"kubesphere.io/kubesphere/pkg/constants"
 	"kubesphere.io/kubesphere/pkg/informers"
 	"kubesphere.io/kubesphere/pkg/models"
 	"kubesphere.io/kubesphere/pkg/models/iam/policy"
 	"kubesphere.io/kubesphere/pkg/models/kubectl"
 	"kubesphere.io/kubesphere/pkg/models/resources"
-	"kubesphere.io/kubesphere/pkg/params"
-	"kubesphere.io/kubesphere/pkg/simple/client/k8s"
+	"kubesphere.io/kubesphere/pkg/server/params"
+	"kubesphere.io/kubesphere/pkg/simple/client"
 	"kubesphere.io/kubesphere/pkg/utils/k8sutil"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
 	"sort"
 	"strings"
-	"time"
 )
 
 const (
@@ -99,7 +98,7 @@ func GetUserRoles(namespace, username string) ([]*rbacv1.Role, error) {
 	roleBindings, err := roleBindingLister.RoleBindings(namespace).List(labels.Everything())
 
 	if err != nil {
-		glog.Errorln("get role bindings", namespace, err)
+		klog.Errorln("get role bindings", namespace, err)
 		return nil, err
 	}
 
@@ -111,10 +110,10 @@ func GetUserRoles(namespace, username string) ([]*rbacv1.Role, error) {
 				clusterRole, err := clusterRoleLister.Get(roleBinding.RoleRef.Name)
 				if err != nil {
 					if apierrors.IsNotFound(err) {
-						glog.Warningf("cluster role %s not found but bind user %s in namespace %s", roleBinding.RoleRef.Name, username, namespace)
+						klog.Warningf("cluster role %s not found but bind user %s in namespace %s", roleBinding.RoleRef.Name, username, namespace)
 						continue
 					} else {
-						glog.Errorln("get cluster role", roleBinding.RoleRef.Name, err)
+						klog.Errorln("get cluster role", roleBinding.RoleRef.Name, err)
 						return nil, err
 					}
 				}
@@ -129,10 +128,10 @@ func GetUserRoles(namespace, username string) ([]*rbacv1.Role, error) {
 
 				if err != nil {
 					if apierrors.IsNotFound(err) {
-						glog.Warningf("namespace %s role %s not found, but bind user %s", namespace, roleBinding.RoleRef.Name, username)
+						klog.Warningf("namespace %s role %s not found, but bind user %s", namespace, roleBinding.RoleRef.Name, username)
 						continue
 					} else {
-						glog.Errorln("get role", roleBinding.Namespace, roleBinding.RoleRef.Name, err)
+						klog.Errorln("get role", roleBinding.Namespace, roleBinding.RoleRef.Name, err)
 						return nil, err
 					}
 				}
@@ -150,7 +149,7 @@ func GetUserClusterRoles(username string) (*rbacv1.ClusterRole, []*rbacv1.Cluste
 	clusterRoleBindings, err := clusterRoleBindingLister.List(labels.Everything())
 
 	if err != nil {
-		glog.Errorln("get cluster role bindings", err)
+		klog.Errorln("get cluster role bindings", err)
 		return nil, nil, err
 	}
 
@@ -161,10 +160,10 @@ func GetUserClusterRoles(username string) (*rbacv1.ClusterRole, []*rbacv1.Cluste
 			clusterRole, err := clusterRoleLister.Get(clusterRoleBinding.RoleRef.Name)
 			if err != nil {
 				if apierrors.IsNotFound(err) {
-					glog.Warningf("cluster role %s not found but bind user %s", clusterRoleBinding.RoleRef.Name, username)
+					klog.Warningf("cluster role %s not found but bind user %s", clusterRoleBinding.RoleRef.Name, username)
 					continue
 				} else {
-					glog.Errorln("get cluster role", clusterRoleBinding.RoleRef.Name, err)
+					klog.Errorln("get cluster role", clusterRoleBinding.RoleRef.Name, err)
 					return nil, nil, err
 				}
 			}
@@ -221,7 +220,7 @@ func GetWorkspaceRoleBindings(workspace string) ([]*rbacv1.ClusterRoleBinding, e
 	clusterRoleBindings, err := informers.SharedInformerFactory().Rbac().V1().ClusterRoleBindings().Lister().List(labels.Everything())
 
 	if err != nil {
-		glog.Errorln("get cluster role bindings", err)
+		klog.Errorln("get cluster role bindings", err)
 		return nil, err
 	}
 
@@ -249,7 +248,7 @@ func GetUserWorkspaceRoleMap(username string) (map[string]string, error) {
 	clusterRoleBindings, err := informers.SharedInformerFactory().Rbac().V1().ClusterRoleBindings().Lister().List(labels.Everything())
 
 	if err != nil {
-		glog.Errorln("get cluster role bindings", err)
+		klog.Errorln("get cluster role bindings", err)
 		return nil, err
 	}
 
@@ -284,7 +283,7 @@ func GetRoleBindings(namespace string, roleName string) ([]*rbacv1.RoleBinding, 
 	roleBindings, err := roleBindingLister.RoleBindings(namespace).List(labels.Everything())
 
 	if err != nil {
-		glog.Errorln("get role bindings", namespace, err)
+		klog.Errorln("get role bindings", namespace, err)
 		return nil, err
 	}
 
@@ -306,7 +305,7 @@ func GetClusterRoleBindings(clusterRoleName string) ([]*rbacv1.ClusterRoleBindin
 	roleBindings, err := clusterRoleBindingLister.List(labels.Everything())
 
 	if err != nil {
-		glog.Errorln("get cluster role bindings", err)
+		klog.Errorln("get cluster role bindings", err)
 		return nil, err
 	}
 
@@ -337,7 +336,7 @@ func ListClusterRoleUsers(clusterRoleName string, conditions *params.Conditions,
 					continue
 				}
 				if err != nil {
-					glog.Errorln("get user info", subject.Name, err)
+					klog.Errorln("get user info", subject.Name, err)
 					return nil, err
 				}
 				users = append(users, user)
@@ -431,7 +430,7 @@ func ListClusterRoles(conditions *params.Conditions, orderBy string, reverse boo
 func NamespaceUsers(namespaceName string) ([]*models.User, error) {
 	namespace, err := informers.SharedInformerFactory().Core().V1().Namespaces().Lister().Get(namespaceName)
 	if err != nil {
-		glog.Errorln("get namespace", namespaceName, err)
+		klog.Errorln("get namespace", namespaceName, err)
 		return nil, err
 	}
 	roleBindings, err := GetRoleBindings(namespaceName, "")
@@ -481,11 +480,11 @@ func GetUserWorkspaceSimpleRules(workspace, username string) ([]models.SimpleRul
 		return nil, err
 	}
 
-	// workspace manager
+	// cluster-admin
 	if RulesMatchesRequired(clusterRules, rbacv1.PolicyRule{
 		Verbs:     []string{"*"},
 		APIGroups: []string{"*"},
-		Resources: []string{"workspaces", "workspaces/*"},
+		Resources: []string{"*"},
 	}) {
 		return GetWorkspaceRoleSimpleRules(workspace, constants.WorkspaceAdmin), nil
 	}
@@ -494,10 +493,23 @@ func GetUserWorkspaceSimpleRules(workspace, username string) ([]models.SimpleRul
 
 	if err != nil {
 		if apierrors.IsNotFound(err) {
+
+			// workspaces-manager
+			if RulesMatchesRequired(clusterRules, rbacv1.PolicyRule{
+				Verbs:     []string{"*"},
+				APIGroups: []string{"*"},
+				Resources: []string{"workspaces", "workspaces/*"},
+			}) {
+				return GetWorkspaceRoleSimpleRules(workspace, constants.WorkspacesManager), nil
+			}
+
 			return []models.SimpleRule{}, nil
 		}
+
+		klog.Error(err)
 		return nil, err
 	}
+
 	return GetWorkspaceRoleSimpleRules(workspace, workspaceRole.Annotations[constants.DisplayNameAnnotationKey]), nil
 }
 
@@ -513,12 +525,16 @@ func GetWorkspaceRoleSimpleRules(workspace, roleName string) []models.SimpleRule
 			{Name: "devops", Actions: []string{"edit", "delete", "create", "view"}},
 			{Name: "projects", Actions: []string{"edit", "delete", "create", "view"}},
 			{Name: "roles", Actions: []string{"view"}},
+			{Name: "apps", Actions: []string{"view", "create", "manage"}},
+			{Name: "repos", Actions: []string{"view", "manage"}},
 		}
 	case constants.WorkspaceRegular:
 		workspaceRules = []models.SimpleRule{
 			{Name: "members", Actions: []string{"view"}},
-			{Name: "devops", Actions: []string{"create"}},
-			{Name: "projects", Actions: []string{"create"}},
+			{Name: "devops", Actions: []string{"view", "create"}},
+			{Name: "projects", Actions: []string{"view", "create"}},
+			{Name: "apps", Actions: []string{"view", "create"}},
+			{Name: "repos", Actions: []string{"view"}},
 		}
 	case constants.WorkspaceViewer:
 		workspaceRules = []models.SimpleRule{
@@ -526,6 +542,14 @@ func GetWorkspaceRoleSimpleRules(workspace, roleName string) []models.SimpleRule
 			{Name: "members", Actions: []string{"view"}},
 			{Name: "devops", Actions: []string{"view"}},
 			{Name: "projects", Actions: []string{"view"}},
+			{Name: "roles", Actions: []string{"view"}},
+			{Name: "apps", Actions: []string{"view"}},
+			{Name: "repos", Actions: []string{"view"}},
+		}
+	case constants.WorkspacesManager:
+		workspaceRules = []models.SimpleRule{
+			{Name: "workspaces", Actions: []string{"edit", "delete", "view"}},
+			{Name: "members", Actions: []string{"edit", "delete", "create", "view"}},
 			{Name: "roles", Actions: []string{"view"}},
 		}
 	}
@@ -540,7 +564,7 @@ func GetClusterRoleSimpleRules(clusterRoleName string) ([]models.SimpleRule, err
 	clusterRole, err := clusterRoleLister.Get(clusterRoleName)
 
 	if err != nil {
-		glog.Errorln("get cluster role", clusterRoleName, clusterRoleName)
+		klog.Errorln("get cluster role", clusterRoleName, clusterRoleName)
 		return nil, err
 	}
 
@@ -576,7 +600,7 @@ func GetRoleSimpleRules(namespace string, roleName string) ([]models.SimpleRule,
 	role, err := roleLister.Roles(namespace).Get(roleName)
 
 	if err != nil {
-		glog.Errorln("get role", namespace, roleName, err)
+		klog.Errorln("get role", namespace, roleName, err)
 		return nil, err
 	}
 
@@ -624,20 +648,20 @@ func CreateClusterRoleBinding(username string, clusterRoleName string) error {
 	_, err := clusterRoleLister.Get(clusterRoleName)
 
 	if err != nil {
-		glog.Errorln("get cluster role", clusterRoleName, err)
+		klog.Errorln("get cluster role", clusterRoleName, err)
 		return err
 	}
 
 	if clusterRoleName == constants.ClusterAdmin {
 		// create kubectl pod if cluster role is cluster-admin
 		if err := kubectl.CreateKubectlDeploy(username); err != nil {
-			glog.Error("create user terminal pod failed", username, err)
+			klog.Error("create user terminal pod failed", username, err)
 		}
 
 	} else {
 		// delete kubectl pod if cluster role is not cluster-admin, whether it exists or not
 		if err := kubectl.DelKubectlDeploy(username); err != nil {
-			glog.Error("delete user terminal pod failed", username, err)
+			klog.Error("delete user terminal pod failed", username, err)
 		}
 	}
 
@@ -650,9 +674,9 @@ func CreateClusterRoleBinding(username string, clusterRoleName string) error {
 	found, err := clusterRoleBindingLister.Get(username)
 
 	if apierrors.IsNotFound(err) {
-		_, err = k8s.Client().RbacV1().ClusterRoleBindings().Create(clusterRoleBinding)
+		_, err = client.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Create(clusterRoleBinding)
 		if err != nil {
-			glog.Errorln("create cluster role binding", err)
+			klog.Errorln("create cluster role binding", err)
 			return err
 		}
 		return nil
@@ -662,31 +686,27 @@ func CreateClusterRoleBinding(username string, clusterRoleName string) error {
 
 	// cluster role changed
 	if found.RoleRef.Name != clusterRoleName {
-		deletePolicy := metav1.DeletePropagationForeground
+		deletePolicy := metav1.DeletePropagationBackground
 		gracePeriodSeconds := int64(0)
 		deleteOption := &metav1.DeleteOptions{PropagationPolicy: &deletePolicy, GracePeriodSeconds: &gracePeriodSeconds}
-		err = k8s.Client().RbacV1().ClusterRoleBindings().Delete(found.Name, deleteOption)
+		err = client.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Delete(found.Name, deleteOption)
 		if err != nil {
-			glog.Errorln("delete cluster role binding", err)
+			klog.Errorln(err)
 			return err
 		}
-		maxRetries := 3
-		for i := 0; i < maxRetries; i++ {
-			_, err = k8s.Client().RbacV1().ClusterRoleBindings().Create(clusterRoleBinding)
-			if err == nil {
-				return nil
-			}
-			time.Sleep(300 * time.Millisecond)
+		_, err = client.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Create(clusterRoleBinding)
+		if err != nil {
+			klog.Errorln(err)
+			return err
 		}
-		glog.Errorln("create cluster role binding", err)
-		return err
+		return nil
 	}
 
 	if !k8sutil.ContainsUser(found.Subjects, username) {
 		found.Subjects = clusterRoleBinding.Subjects
-		_, err = k8s.Client().RbacV1().ClusterRoleBindings().Update(found)
+		_, err = client.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Update(found)
 		if err != nil {
-			glog.Errorln("update cluster role binding", err)
+			klog.Errorln("update cluster role binding", err)
 			return err
 		}
 	}

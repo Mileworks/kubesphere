@@ -18,251 +18,226 @@
 package openpitrix
 
 import (
-	"bytes"
-	"encoding/json"
-	"flag"
+	"context"
 	"fmt"
-	"github.com/golang/glog"
-	"io/ioutil"
-	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
-	"net/http"
+	"k8s.io/klog"
+	"openpitrix.io/openpitrix/pkg/manager"
+	"openpitrix.io/openpitrix/pkg/pb"
+	"openpitrix.io/openpitrix/pkg/sender"
+	"openpitrix.io/openpitrix/pkg/util/ctxutil"
+	"strconv"
 	"strings"
-	"sync"
 )
 
-var (
-	openpitrixAPIServer  string
-	openpitrixProxyToken string
-	once                 sync.Once
-	c                    client
+const (
+	KubernetesProvider = "kubernetes"
+	Unknown            = "-"
+	DeploySuffix       = "-Deployment"
+	DaemonSuffix       = "-DaemonSet"
+	StateSuffix        = "-StatefulSet"
+	SystemUsername     = "system"
+	SystemUserPath     = ":system"
 )
 
-type RunTime struct {
-	RuntimeId         string `json:"runtime_id"`
-	RuntimeUrl        string `json:"runtime_url"`
-	Name              string `json:"name"`
-	Provider          string `json:"provider"`
-	Zone              string `json:"zone"`
-	RuntimeCredential string `json:"runtime_credential"`
+type OpenPitrixClient struct {
+	runtime     pb.RuntimeManagerClient
+	cluster     pb.ClusterManagerClient
+	app         pb.AppManagerClient
+	repo        pb.RepoManagerClient
+	category    pb.CategoryManagerClient
+	attachment  pb.AttachmentManagerClient
+	repoIndexer pb.RepoIndexerClient
 }
 
-type Interface interface {
-	CreateRuntime(runtime *RunTime) error
-	DeleteRuntime(runtimeId string) error
-}
-type cluster struct {
-	Status    string `json:"status"`
-	ClusterId string `json:"cluster_id"`
-}
-
-type Error struct {
-	status  int
-	message string
-}
-
-func (e Error) Error() string {
-	return fmt.Sprintf("status: %d,message: %s", e.status, e.message)
-}
-
-type client struct {
-	client http.Client
-}
-
-func init() {
-	flag.StringVar(&openpitrixAPIServer, "openpitrix-api-server", "http://openpitrix-api-gateway.openpitrix-system.svc:9100", "openpitrix api server")
-	flag.StringVar(&openpitrixProxyToken, "openpitrix-proxy-token", "", "openpitrix proxy token")
-}
-
-func Client() Interface {
-	once.Do(func() {
-		c = client{client: http.Client{}}
-	})
-	return c
-}
-
-func (c client) CreateRuntime(runtime *RunTime) error {
-
-	data, err := json.Marshal(runtime)
+func parseToHostPort(endpoint string) (string, int, error) {
+	args := strings.Split(endpoint, ":")
+	if len(args) != 2 {
+		return "", 0, fmt.Errorf("invalid server host: %s", endpoint)
+	}
+	host := args[0]
+	port, err := strconv.Atoi(args[1])
 	if err != nil {
-		return err
+		return "", 0, err
 	}
-
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/v1/runtimes", openpitrixAPIServer), bytes.NewReader(data))
-
-	if err != nil {
-		return err
-	}
-	req.Header.Add("Content-Type", "application/json")
-	req.Header.Add("Authorization", openpitrixProxyToken)
-
-	resp, err := c.client.Do(req)
-
-	if err != nil {
-		glog.Error(err)
-		return err
-	}
-	defer resp.Body.Close()
-	data, err = ioutil.ReadAll(resp.Body)
-
-	if err != nil {
-		glog.Error(err)
-		return err
-	}
-
-	if resp.StatusCode > http.StatusOK {
-		err = Error{resp.StatusCode, string(data)}
-		glog.Error(err)
-		return err
-	}
-
-	return nil
+	return host, port, nil
 }
 
-func (c client) deleteClusters(clusters []cluster) error {
-	clusterId := make([]string, 0)
-
-	for _, cluster := range clusters {
-		if cluster.Status != "deleted" && cluster.Status != "deleting" && !sliceutil.HasString(clusterId, cluster.ClusterId) {
-			clusterId = append(clusterId, cluster.ClusterId)
-		}
+func newRuntimeManagerClient(endpoint string) (pb.RuntimeManagerClient, error) {
+	host, port, err := parseToHostPort(endpoint)
+	conn, err := manager.NewClient(host, port)
+	if err != nil {
+		return nil, err
 	}
-
-	if len(clusterId) == 0 {
-		return nil
+	return pb.NewRuntimeManagerClient(conn), nil
+}
+func newClusterManagerClient(endpoint string) (pb.ClusterManagerClient, error) {
+	host, port, err := parseToHostPort(endpoint)
+	conn, err := manager.NewClient(host, port)
+	if err != nil {
+		return nil, err
 	}
-
-	deleteRequest := struct {
-		ClusterId []string `json:"cluster_id"`
-	}{
-		ClusterId: clusterId,
+	return pb.NewClusterManagerClient(conn), nil
+}
+func newCategoryManagerClient(endpoint string) (pb.CategoryManagerClient, error) {
+	host, port, err := parseToHostPort(endpoint)
+	conn, err := manager.NewClient(host, port)
+	if err != nil {
+		return nil, err
 	}
-	data, _ := json.Marshal(deleteRequest)
-	req, err := http.NewRequest(http.MethodPost, fmt.Sprintf("%s/v1/clusters/delete", openpitrixAPIServer), bytes.NewReader(data))
+	return pb.NewCategoryManagerClient(conn), nil
+}
+
+func newAttachmentManagerClient(endpoint string) (pb.AttachmentManagerClient, error) {
+	host, port, err := parseToHostPort(endpoint)
+	conn, err := manager.NewClient(host, port)
+	if err != nil {
+		return nil, err
+	}
+	return pb.NewAttachmentManagerClient(conn), nil
+}
+
+func newRepoManagerClient(endpoint string) (pb.RepoManagerClient, error) {
+	host, port, err := parseToHostPort(endpoint)
+	conn, err := manager.NewClient(host, port)
+	if err != nil {
+		return nil, err
+	}
+	return pb.NewRepoManagerClient(conn), nil
+}
+
+func newRepoIndexer(endpoint string) (pb.RepoIndexerClient, error) {
+	host, port, err := parseToHostPort(endpoint)
+	conn, err := manager.NewClient(host, port)
+	if err != nil {
+		return nil, err
+	}
+	return pb.NewRepoIndexerClient(conn), nil
+}
+
+func newAppManagerClient(endpoint string) (pb.AppManagerClient, error) {
+	host, port, err := parseToHostPort(endpoint)
+	conn, err := manager.NewClient(host, port)
+	if err != nil {
+		return nil, err
+	}
+	return pb.NewAppManagerClient(conn), nil
+}
+
+func NewOpenPitrixClient(options *OpenPitrixOptions) (*OpenPitrixClient, error) {
+
+	runtimeMangerClient, err := newRuntimeManagerClient(options.RuntimeManagerEndpoint)
 
 	if err != nil {
-		return err
-	}
-	req.Header.Add("Authorization", openpitrixProxyToken)
-
-	resp, err := c.client.Do(req)
-	if err != nil {
-		glog.Error(err)
-		return err
+		klog.Error(err)
+		return nil, err
 	}
 
-	defer resp.Body.Close()
-	data, err = ioutil.ReadAll(resp.Body)
+	clusterManagerClient, err := newClusterManagerClient(options.ClusterManagerEndpoint)
 
 	if err != nil {
-		glog.Error(err)
-		return err
+		klog.Error(err)
+		return nil, err
 	}
 
-	if resp.StatusCode > http.StatusOK {
-		err = Error{resp.StatusCode, string(data)}
-		glog.Error(err)
-		return err
+	repoManagerClient, err := newRepoManagerClient(options.RepoManagerEndpoint)
+
+	if err != nil {
+		klog.Error(err)
+		return nil, err
 	}
 
-	return nil
+	repoIndexerClient, err := newRepoIndexer(options.RepoIndexerEndpoint)
+
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+
+	appManagerClient, err := newAppManagerClient(options.AppManagerEndpoint)
+
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+
+	categoryManagerClient, err := newCategoryManagerClient(options.CategoryManagerEndpoint)
+
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+
+	attachmentManagerClient, err := newAttachmentManagerClient(options.AttachmentManagerEndpoint)
+
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+
+	client := OpenPitrixClient{
+		runtime:     runtimeMangerClient,
+		cluster:     clusterManagerClient,
+		repo:        repoManagerClient,
+		app:         appManagerClient,
+		category:    categoryManagerClient,
+		attachment:  attachmentManagerClient,
+		repoIndexer: repoIndexerClient,
+	}
+
+	return &client, nil
+}
+func (c *OpenPitrixClient) Runtime() pb.RuntimeManagerClient {
+	return c.runtime
+}
+func (c *OpenPitrixClient) App() pb.AppManagerClient {
+	return c.app
+}
+func (c *OpenPitrixClient) Cluster() pb.ClusterManagerClient {
+	return c.cluster
+}
+func (c *OpenPitrixClient) Category() pb.CategoryManagerClient {
+	return c.category
 }
 
-func (c client) listClusters(runtimeId string) ([]cluster, error) {
-	limit := 200
-	offset := 0
-	clusters := make([]cluster, 0)
-	for {
-		req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/v1/clusters?runtime_id=%s&limit=%d&offset=%d", openpitrixAPIServer, runtimeId, limit, offset), nil)
-
-		if err != nil {
-			glog.Error(err)
-			return nil, err
-		}
-
-		req.Header.Add("Authorization", openpitrixProxyToken)
-
-		resp, err := c.client.Do(req)
-
-		if err != nil {
-			glog.Error(err)
-			return nil, err
-		}
-
-		data, err := ioutil.ReadAll(resp.Body)
-
-		if err != nil {
-			glog.Error(err)
-			return nil, err
-		}
-
-		resp.Body.Close()
-
-		if resp.StatusCode > http.StatusOK {
-			err = Error{resp.StatusCode, string(data)}
-			glog.Error(err)
-			return nil, err
-		}
-		listClusterResponse := struct {
-			TotalCount int       `json:"total_count"`
-			ClusterSet []cluster `json:"cluster_set"`
-		}{}
-		err = json.Unmarshal(data, &listClusterResponse)
-
-		if err != nil {
-			glog.Error(err)
-			return nil, err
-		}
-
-		clusters = append(clusters, listClusterResponse.ClusterSet...)
-
-		if listClusterResponse.TotalCount <= limit+offset {
-			break
-		}
-
-		offset += limit
-	}
-
-	return clusters, nil
+func (c *OpenPitrixClient) Repo() pb.RepoManagerClient {
+	return c.repo
 }
 
-func (c client) DeleteRuntime(runtimeId string) error {
-	clusters, err := c.listClusters(runtimeId)
+func (c *OpenPitrixClient) RepoIndexer() pb.RepoIndexerClient {
+	return c.repoIndexer
+}
 
-	if err != nil {
-		glog.Error(err)
-		return err
+func (c *OpenPitrixClient) Attachment() pb.AttachmentManagerClient {
+	return c.attachment
+}
+
+func SystemContext() context.Context {
+	ctx := context.Background()
+	ctx = ctxutil.ContextWithSender(ctx, sender.New(SystemUsername, SystemUserPath, ""))
+	return ctx
+}
+func ContextWithUsername(username string) context.Context {
+	ctx := context.Background()
+	if username == "" {
+		username = SystemUsername
 	}
-
-	err = c.deleteClusters(clusters)
-
-	if err != nil {
-		glog.Error(err)
-		return err
-	}
-
-	return nil
+	ctx = ctxutil.ContextWithSender(ctx, sender.New(username, SystemUserPath, ""))
+	return ctx
 }
 
 func IsNotFound(err error) bool {
-	if e, ok := err.(Error); ok {
-		if e.status == http.StatusNotFound {
-			return true
-		}
-		if strings.Contains(e.message, "not exist") {
-			return true
-		}
-		if strings.Contains(e.message, "not found") {
-			return true
-		}
+	if strings.Contains(err.Error(), "not exist") {
+		return true
+	}
+	if strings.Contains(err.Error(), "not found") {
+		return true
 	}
 	return false
 }
 
 func IsDeleted(err error) bool {
-	if e, ok := err.(Error); ok {
-		if strings.Contains(e.message, "is [deleted]") {
-			return true
-		}
+	if strings.Contains(err.Error(), "is [deleted]") {
+		return true
 	}
 	return false
 }

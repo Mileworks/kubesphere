@@ -10,6 +10,7 @@ git:
 
 go:
   - "1.12.x"
+  - "tip"
 env:
   - GO111MODULE=on
 cache:
@@ -21,7 +22,15 @@ before_script:
   - bash hack/install_kubebuilder.sh
 
 script:
+  - diff -u <(echo -n) <(gofmt -d ./pkg ./cmd ./tools)
+  - make openapi
   - make all 
+
+before_install:
+  - go get -t -v ./...
+
+after_success:
+  - bash <(curl -s https://codecov.io/bash)
 
 deploy:
   skip_cleanup: true

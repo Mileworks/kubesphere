@@ -23,17 +23,15 @@ import (
 	"fmt"
 	"github.com/emicklei/go-restful"
 	"io/ioutil"
+	"k8s.io/klog"
 	"kubesphere.io/kubesphere/pkg/constants"
 	"kubesphere.io/kubesphere/pkg/db"
 	"kubesphere.io/kubesphere/pkg/informers"
 	"kubesphere.io/kubesphere/pkg/models/devops"
 	"kubesphere.io/kubesphere/pkg/models/kubeconfig"
 	"kubesphere.io/kubesphere/pkg/models/kubectl"
-	"kubesphere.io/kubesphere/pkg/params"
-	"kubesphere.io/kubesphere/pkg/simple/client/admin_jenkins"
-	"kubesphere.io/kubesphere/pkg/simple/client/devops_mysql"
-	"kubesphere.io/kubesphere/pkg/simple/client/k8s"
-	"kubesphere.io/kubesphere/pkg/simple/client/redis"
+	"kubesphere.io/kubesphere/pkg/server/params"
+	clientset "kubesphere.io/kubesphere/pkg/simple/client"
 	"kubesphere.io/kubesphere/pkg/utils/k8sutil"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
 	"net/http"
@@ -45,23 +43,22 @@ import (
 
 	"github.com/dgrijalva/jwt-go"
 	"github.com/go-ldap/ldap"
-	"github.com/golang/glog"
 	rbacv1 "k8s.io/api/rbac/v1"
-	meta_v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	ldapclient "kubesphere.io/kubesphere/pkg/simple/client/ldap"
-
 	"kubesphere.io/kubesphere/pkg/models"
 	"kubesphere.io/kubesphere/pkg/utils/jwtutil"
 )
 
 var (
-	adminEmail       string
-	adminPassword    string
-	tokenExpireTime  time.Duration
-	maxAuthFailed    int
-	authTimeInterval time.Duration
-	initUsers        []initUser
+	adminEmail         string
+	adminPassword      string
+	tokenIdleTimeout   time.Duration
+	maxAuthFailed      int
+	authTimeInterval   time.Duration
+	initUsers          []initUser
+	enableMultiLogin   bool
+	generateKubeConfig bool
 )
 
 type initUser struct {
@@ -76,30 +73,25 @@ const (
 	defaultAuthTimeInterval = 30 * time.Minute
 )
 
-func Init(email, password string, expireTime time.Duration, authRateLimit string) error {
+func Init(email, password, authRateLimit string, idleTimeout time.Duration, multiLogin bool, isGeneratingKubeConfig bool) error {
 	adminEmail = email
 	adminPassword = password
-	tokenExpireTime = expireTime
+	tokenIdleTimeout = idleTimeout
 	maxAuthFailed, authTimeInterval = parseAuthRateLimit(authRateLimit)
-	conn, err := ldapclient.Client()
+	enableMultiLogin = multiLogin
+	generateKubeConfig = isGeneratingKubeConfig
+
+	err := checkAndCreateDefaultUser()
 
 	if err != nil {
+		klog.Errorln("create default users", err)
 		return err
 	}
 
-	defer conn.Close()
-
-	err = checkAndCreateDefaultUser(conn)
+	err = checkAndCreateDefaultGroup()
 
 	if err != nil {
-		glog.Errorln("create default users", err)
-		return err
-	}
-
-	err = checkAndCreateDefaultGroup(conn)
-
-	if err != nil {
-		glog.Errorln("create default groups", err)
+		klog.Errorln("create default groups", err)
 		return err
 	}
 
@@ -117,28 +109,38 @@ func parseAuthRateLimit(authRateLimit string) (int, time.Duration) {
 		maxCount, _ = strconv.Atoi(groups[1])
 		timeInterval, _ = time.ParseDuration(groups[2])
 	} else {
-		glog.Warning("invalid auth rate limit", authRateLimit)
+		klog.Warning("invalid auth rate limit", authRateLimit)
 	}
 
 	return maxCount, timeInterval
 }
 
-func checkAndCreateDefaultGroup(conn ldap.Client) error {
+func checkAndCreateDefaultGroup() error {
+
+	client, err := clientset.ClientSets().Ldap()
+	if err != nil {
+		return err
+	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
 	groupSearchRequest := ldap.NewSearchRequest(
-		ldapclient.GroupSearchBase,
+		client.GroupSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		"(&(objectClass=posixGroup))",
 		nil,
 		nil,
 	)
 
-	_, err := conn.Search(groupSearchRequest)
+	_, err = conn.Search(groupSearchRequest)
 
 	if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
-		err = createGroupsBaseDN(conn)
+		err = createGroupsBaseDN()
 		if err != nil {
-			return fmt.Errorf("GroupBaseDN %s create failed: %s\n", ldapclient.GroupSearchBase, err)
+			return fmt.Errorf("GroupBaseDN %s create failed: %s\n", client.GroupSearchBase(), err)
 		}
 	}
 
@@ -149,10 +151,20 @@ func checkAndCreateDefaultGroup(conn ldap.Client) error {
 	return nil
 }
 
-func checkAndCreateDefaultUser(conn ldap.Client) error {
+func checkAndCreateDefaultUser() error {
+
+	client, err := clientset.ClientSets().Ldap()
+	if err != nil {
+		return err
+	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
 
 	userSearchRequest := ldap.NewSearchRequest(
-		ldapclient.UserSearchBase,
+		client.UserSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		"(&(objectClass=inetOrgPerson))",
 		[]string{"uid"},
@@ -162,9 +174,9 @@ func checkAndCreateDefaultUser(conn ldap.Client) error {
 	result, err := conn.Search(userSearchRequest)
 
 	if ldap.IsErrorWithCode(err, ldap.LDAPResultNoSuchObject) {
-		err = createUserBaseDN(conn)
+		err = createUserBaseDN()
 		if err != nil {
-			return fmt.Errorf("UserBaseDN %s create failed: %s\n", ldapclient.UserSearchBase, err)
+			return fmt.Errorf("UserBaseDN %s create failed: %s\n", client.UserSearchBase(), err)
 		}
 	}
 
@@ -182,7 +194,7 @@ func checkAndCreateDefaultUser(conn ldap.Client) error {
 		if result == nil || !containsUser(result.Entries, user) {
 			_, err = CreateUser(&user.User)
 			if err != nil && !ldap.IsErrorWithCode(err, ldap.LDAPResultEntryAlreadyExists) {
-				glog.Errorln("user init failed", user.Username, err)
+				klog.Errorln("user init failed", user.Username, err)
 				return fmt.Errorf("user %s init failed: %s\n", user.Username, err)
 			}
 		}
@@ -201,36 +213,87 @@ func containsUser(entries []*ldap.Entry, user initUser) bool {
 	return false
 }
 
-func createUserBaseDN(conn ldap.Client) error {
+func createUserBaseDN() error {
+	client, err := clientset.ClientSets().Ldap()
 
-	conn, err := ldapclient.Client()
+	if err != nil {
+		return err
+	}
+	conn, err := client.NewConn()
 	if err != nil {
 		return err
 	}
 	defer conn.Close()
-
-	groupsCreateRequest := ldap.NewAddRequest(ldapclient.UserSearchBase, nil)
+	groupsCreateRequest := ldap.NewAddRequest(client.UserSearchBase(), nil)
 	groupsCreateRequest.Attribute("objectClass", []string{"organizationalUnit", "top"})
 	groupsCreateRequest.Attribute("ou", []string{"Users"})
 	return conn.Add(groupsCreateRequest)
 }
 
-func createGroupsBaseDN(conn ldap.Client) error {
-	groupsCreateRequest := ldap.NewAddRequest(ldapclient.GroupSearchBase, nil)
+func createGroupsBaseDN() error {
+	client, err := clientset.ClientSets().Ldap()
+
+	if err != nil {
+		return err
+	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	groupsCreateRequest := ldap.NewAddRequest(client.GroupSearchBase(), nil)
 	groupsCreateRequest.Attribute("objectClass", []string{"organizationalUnit", "top"})
 	groupsCreateRequest.Attribute("ou", []string{"Groups"})
 	return conn.Add(groupsCreateRequest)
 }
 
-// User login
-func Login(username string, password string, ip string) (*models.Token, error) {
+func RefreshToken(refreshToken string) (*models.AuthGrantResponse, error) {
+	validRefreshToken, err := jwtutil.ValidateToken(refreshToken)
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
 
-	redisClient := redis.Client()
+	payload, ok := validRefreshToken.Claims.(jwt.MapClaims)
+
+	if !ok {
+		err = errors.New("invalid payload")
+		klog.Error(err)
+		return nil, err
+	}
+
+	claims := jwt.MapClaims{}
+
+	// token with expiration time will not auto sliding
+	claims["username"] = payload["username"]
+	claims["email"] = payload["email"]
+	claims["iat"] = time.Now().Unix()
+	claims["exp"] = time.Now().Add(tokenIdleTimeout * 4).Unix()
+
+	token := jwtutil.MustSigned(claims)
+
+	claims = jwt.MapClaims{}
+	claims["username"] = payload["username"]
+	claims["email"] = payload["email"]
+	claims["iat"] = time.Now().Unix()
+	claims["type"] = "refresh_token"
+	claims["exp"] = time.Now().Add(tokenIdleTimeout * 5).Unix()
+
+	refreshToken = jwtutil.MustSigned(claims)
+
+	return &models.AuthGrantResponse{TokenType: "jwt", Token: token, RefreshToken: refreshToken, ExpiresIn: (tokenIdleTimeout * 4).Seconds()}, nil
+}
+
+func PasswordCredentialGrant(username, password, ip string) (*models.AuthGrantResponse, error) {
+	redisClient, err := clientset.ClientSets().Redis()
+	if err != nil {
+		return nil, err
+	}
 
 	records, err := redisClient.Keys(fmt.Sprintf("kubesphere:authfailed:%s:*", username)).Result()
 
 	if err != nil {
-		glog.Error(err)
+		klog.Error(err)
 		return nil, err
 	}
 
@@ -238,17 +301,18 @@ func Login(username string, password string, ip string) (*models.Token, error) {
 		return nil, restful.NewError(http.StatusTooManyRequests, "auth rate limit exceeded")
 	}
 
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
-		glog.Error(err)
 		return nil, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
 	userSearchRequest := ldap.NewSearchRequest(
-		ldapclient.UserSearchBase,
+		client.UserSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		fmt.Sprintf("(&(objectClass=inetOrgPerson)(|(uid=%s)(mail=%s)))", username, username),
 		[]string{"uid", "mail"},
@@ -273,10 +337,10 @@ func Login(username string, password string, ip string) (*models.Token, error) {
 	err = conn.Bind(dn, password)
 
 	if err != nil {
-		glog.Infoln("auth failed", username, err)
+		klog.Infoln("auth failed", username, err)
 
 		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
-			loginFailedRecord := fmt.Sprintf("kubesphere:authfailed:%s:%d", username, time.Now().UnixNano())
+			loginFailedRecord := fmt.Sprintf("kubesphere:authfailed:%s:%d", uid, time.Now().UnixNano())
 			redisClient.Set(loginFailedRecord, "", authTimeInterval)
 		}
 
@@ -285,29 +349,167 @@ func Login(username string, password string, ip string) (*models.Token, error) {
 
 	claims := jwt.MapClaims{}
 
-	if tokenExpireTime > 0 {
-		claims["exp"] = time.Now().Add(tokenExpireTime).Unix()
-	}
+	// token with expiration time will not auto sliding
 	claims["username"] = uid
 	claims["email"] = email
+	claims["iat"] = time.Now().Unix()
+	claims["exp"] = time.Now().Add(tokenIdleTimeout * 4).Unix()
 
 	token := jwtutil.MustSigned(claims)
 
+	if !enableMultiLogin {
+		// multi login not allowed, remove the previous token
+		sessions, err := redisClient.Keys(fmt.Sprintf("kubesphere:users:%s:token:*", uid)).Result()
+
+		if err != nil {
+			klog.Errorln(err)
+			return nil, err
+		}
+
+		if len(sessions) > 0 {
+			klog.V(4).Infoln("revoke token", sessions)
+			err = redisClient.Del(sessions...).Err()
+			if err != nil {
+				klog.Errorln(err)
+				return nil, err
+			}
+		}
+	}
+
+	claims = jwt.MapClaims{}
+	claims["username"] = uid
+	claims["email"] = email
+	claims["iat"] = time.Now().Unix()
+	claims["type"] = "refresh_token"
+	claims["exp"] = time.Now().Add(tokenIdleTimeout * 5).Unix()
+
+	refreshToken := jwtutil.MustSigned(claims)
+
 	loginLog(uid, ip)
 
-	return &models.Token{Token: token}, nil
+	return &models.AuthGrantResponse{TokenType: "jwt", Token: token, RefreshToken: refreshToken, ExpiresIn: (tokenIdleTimeout * 4).Seconds()}, nil
+}
+
+// User login
+func Login(username, password, ip string) (*models.AuthGrantResponse, error) {
+
+	redisClient, err := clientset.ClientSets().Redis()
+	if err != nil {
+		return nil, err
+	}
+
+	records, err := redisClient.Keys(fmt.Sprintf("kubesphere:authfailed:%s:*", username)).Result()
+
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+
+	if len(records) >= maxAuthFailed {
+		return nil, restful.NewError(http.StatusTooManyRequests, "auth rate limit exceeded")
+	}
+
+	client, err := clientset.ClientSets().Ldap()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	userSearchRequest := ldap.NewSearchRequest(
+		client.UserSearchBase(),
+		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
+		fmt.Sprintf("(&(objectClass=inetOrgPerson)(|(uid=%s)(mail=%s)))", username, username),
+		[]string{"uid", "mail"},
+		nil,
+	)
+
+	result, err := conn.Search(userSearchRequest)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if len(result.Entries) != 1 {
+		return nil, ldap.NewError(ldap.LDAPResultInvalidCredentials, errors.New("incorrect password"))
+	}
+
+	uid := result.Entries[0].GetAttributeValue("uid")
+	email := result.Entries[0].GetAttributeValue("mail")
+	dn := result.Entries[0].DN
+
+	// bind as the user to verify their password
+	err = conn.Bind(dn, password)
+
+	if err != nil {
+		klog.Infoln("auth failed", username, err)
+
+		if ldap.IsErrorWithCode(err, ldap.LDAPResultInvalidCredentials) {
+			loginFailedRecord := fmt.Sprintf("kubesphere:authfailed:%s:%d", uid, time.Now().UnixNano())
+			redisClient.Set(loginFailedRecord, "", authTimeInterval)
+		}
+
+		return nil, err
+	}
+
+	claims := jwt.MapClaims{}
+
+	// token without expiration time will auto sliding
+	claims["username"] = uid
+	claims["email"] = email
+	claims["iat"] = time.Now().Unix()
+
+	token := jwtutil.MustSigned(claims)
+
+	if !enableMultiLogin {
+		// multi login not allowed, remove the previous token
+		sessions, err := redisClient.Keys(fmt.Sprintf("kubesphere:users:%s:token:*", uid)).Result()
+
+		if err != nil {
+			klog.Errorln(err)
+			return nil, err
+		}
+
+		if len(sessions) > 0 {
+			klog.V(4).Infoln("revoke token", sessions)
+			err = redisClient.Del(sessions...).Err()
+			if err != nil {
+				klog.Errorln(err)
+				return nil, err
+			}
+		}
+	}
+
+	// cache token with expiration time
+	if err = redisClient.Set(fmt.Sprintf("kubesphere:users:%s:token:%s", uid, token), token, tokenIdleTimeout).Err(); err != nil {
+		klog.Errorln(err)
+		return nil, err
+	}
+
+	loginLog(uid, ip)
+
+	return &models.AuthGrantResponse{Token: token}, nil
 }
 
 func loginLog(uid, ip string) {
 	if ip != "" {
-		redisClient := redis.Client()
+		redisClient, err := clientset.ClientSets().Redis()
+		if err != nil {
+			return
+		}
 		redisClient.RPush(fmt.Sprintf("kubesphere:users:%s:login-log", uid), fmt.Sprintf("%s,%s", time.Now().UTC().Format("2006-01-02T15:04:05Z"), ip))
 		redisClient.LTrim(fmt.Sprintf("kubesphere:users:%s:login-log", uid), -10, -1)
 	}
 }
 
 func LoginLog(username string) ([]string, error) {
-	redisClient := redis.Client()
+	redisClient, err := clientset.ClientSets().Redis()
+	if err != nil {
+		return nil, err
+	}
 
 	data, err := redisClient.LRange(fmt.Sprintf("kubesphere:users:%s:login-log", username), -10, -1).Result()
 
@@ -320,12 +522,14 @@ func LoginLog(username string) ([]string, error) {
 
 func ListUsers(conditions *params.Conditions, orderBy string, reverse bool, limit, offset int) (*models.PageableResponse, error) {
 
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return nil, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
 	pageControl := ldap.NewControlPaging(1000)
@@ -356,7 +560,7 @@ func ListUsers(conditions *params.Conditions, orderBy string, reverse bool, limi
 
 	for {
 		userSearchRequest := ldap.NewSearchRequest(
-			ldapclient.UserSearchBase,
+			client.UserSearchBase(),
 			ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 			filter,
 			[]string{"uid", "mail", "description", "preferredLanguage", "createTimestamp"},
@@ -366,7 +570,7 @@ func ListUsers(conditions *params.Conditions, orderBy string, reverse bool, limi
 		response, err := conn.Search(userSearchRequest)
 
 		if err != nil {
-			glog.Errorln("search user", err)
+			klog.Errorln("search user", err)
 			return nil, err
 		}
 
@@ -416,7 +620,6 @@ func ListUsers(conditions *params.Conditions, orderBy string, reverse bool, limi
 
 		if i >= offset && len(items) < limit {
 
-			user.AvatarUrl = getAvatar(user.Username)
 			user.LastLoginTime = getLastLoginTime(user.Username)
 			clusterRole, err := GetUserClusterRole(user.Username)
 			if err != nil {
@@ -453,22 +656,24 @@ func DescribeUser(username string) (*models.User, error) {
 		user.Groups = groups
 	}
 
-	user.AvatarUrl = getAvatar(username)
-
 	return user, nil
 }
 
 // Get user info only included email description & lang
 func GetUserInfo(username string) (*models.User, error) {
 
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return nil, err
 	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
 
 	userSearchRequest := ldap.NewSearchRequest(
-		ldapclient.UserSearchBase,
+		client.UserSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		fmt.Sprintf("(&(objectClass=inetOrgPerson)(uid=%s))", username),
 		[]string{"mail", "description", "preferredLanguage", "createTimestamp"},
@@ -478,7 +683,7 @@ func GetUserInfo(username string) (*models.User, error) {
 	result, err := conn.Search(userSearchRequest)
 
 	if err != nil {
-		glog.Errorln("search user", err)
+		klog.Errorln("search user", err)
 		return nil, err
 	}
 
@@ -498,16 +703,18 @@ func GetUserInfo(username string) (*models.User, error) {
 }
 
 func GetUserGroups(username string) ([]string, error) {
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return nil, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
 	groupSearchRequest := ldap.NewSearchRequest(
-		ldapclient.GroupSearchBase,
+		client.GroupSearchBase(),
 		ldap.ScopeBaseObject, ldap.NeverDerefAliases, 0, 0, false,
 		fmt.Sprintf("(&(objectClass=posixGroup)(memberUid=%s))", username),
 		nil,
@@ -531,7 +738,12 @@ func GetUserGroups(username string) ([]string, error) {
 }
 
 func getLastLoginTime(username string) string {
-	lastLogin, err := redis.Client().LRange(fmt.Sprintf("kubesphere:users:%s:login-log", username), -1, -1).Result()
+	redis, err := clientset.ClientSets().Redis()
+	if err != nil {
+		return ""
+	}
+
+	lastLogin, err := redis.LRange(fmt.Sprintf("kubesphere:users:%s:login-log", username), -1, -1).Result()
 
 	if err != nil {
 		return ""
@@ -544,82 +756,83 @@ func getLastLoginTime(username string) string {
 	return ""
 }
 
-func setAvatar(username, avatar string) error {
-	_, err := redis.Client().HMSet("kubesphere:users:avatar", map[string]interface{}{"username": avatar}).Result()
-	return err
-}
-
-func getAvatar(username string) string {
-
-	avatar, err := redis.Client().HMGet("kubesphere:users:avatar", username).Result()
-
-	if err != nil {
-		return ""
-	}
-
-	if len(avatar) > 0 {
-		if url, ok := avatar[0].(string); ok {
-			return url
-		}
-	}
-
-	return ""
-}
-
 func DeleteUser(username string) error {
 
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return err
+	}
 	defer conn.Close()
 
-	deleteRequest := ldap.NewDelRequest(fmt.Sprintf("uid=%s,%s", username, ldapclient.UserSearchBase), nil)
+	deleteRequest := ldap.NewDelRequest(fmt.Sprintf("uid=%s,%s", username, client.UserSearchBase()), nil)
 
 	if err = conn.Del(deleteRequest); err != nil {
-		glog.Errorln("delete user", err)
+		klog.Errorln("delete user", err)
 		return err
 	}
 
 	if err = deleteRoleBindings(username); err != nil {
-		glog.Errorln("delete user role bindings failed", username, err)
+		klog.Errorln("delete user role bindings failed", username, err)
 	}
 
 	if err := kubeconfig.DelKubeConfig(username); err != nil {
-		glog.Errorln("delete user kubeconfig failed", username, err)
+		klog.Errorln("delete user kubeconfig failed", username, err)
 	}
 
 	if err := kubectl.DelKubectlDeploy(username); err != nil {
-		glog.Errorln("delete user terminal pod failed", username, err)
+		klog.Errorln("delete user terminal pod failed", username, err)
 	}
 
-	devopsDb := devops_mysql.OpenDatabase()
-
-	jenkinsClient := admin_jenkins.Client()
-	if jenkinsClient == nil {
-		err := fmt.Errorf("could not connect to jenkins")
-		glog.Error(err)
-		return restful.NewError(http.StatusServiceUnavailable, err.Error())
+	if err := deleteUserInDevOps(username); err != nil {
+		klog.Errorln("delete user in devops failed", username, err)
 	}
+	return nil
+
+}
+
+// deleteUserInDevOps is used to clean up user data of devops, such as permission rules
+func deleteUserInDevOps(username string) error {
+
+	devopsDb, err := clientset.ClientSets().MySQL()
+	if err != nil {
+		if _, ok := err.(clientset.ClientSetNotEnabledError); ok {
+			klog.Warning("devops client is not enable")
+			return nil
+		}
+		return err
+	}
+
+	dp, err := clientset.ClientSets().Devops()
+	if err != nil {
+		if _, ok := err.(clientset.ClientSetNotEnabledError); ok {
+			klog.Warning("devops client is not enable")
+			return nil
+		}
+
+		return err
+	}
+
+	jenkinsClient := dp.Jenkins()
+
 	_, err = devopsDb.DeleteFrom(devops.DevOpsProjectMembershipTableName).
 		Where(db.And(
 			db.Eq(devops.DevOpsProjectMembershipUsernameColumn, username),
 		)).Exec()
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		return err
 	}
 
 	err = jenkinsClient.DeleteUserInProject(username)
 	if err != nil {
-		glog.Errorf("%+v", err)
+		klog.Errorf("%+v", err)
 		return err
 	}
-
 	return nil
-
 }
 
 func deleteRoleBindings(username string) error {
@@ -644,17 +857,17 @@ func deleteRoleBindings(username string) error {
 		length2 := len(roleBinding.Subjects)
 
 		if length2 == 0 {
-			deletePolicy := meta_v1.DeletePropagationForeground
-			err = k8s.Client().RbacV1().RoleBindings(roleBinding.Namespace).Delete(roleBinding.Name, &meta_v1.DeleteOptions{PropagationPolicy: &deletePolicy})
+			deletePolicy := metav1.DeletePropagationBackground
+			err = clientset.ClientSets().K8s().Kubernetes().RbacV1().RoleBindings(roleBinding.Namespace).Delete(roleBinding.Name, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
 
 			if err != nil {
-				glog.Errorf("delete role binding %s %s %s failed: %v", username, roleBinding.Namespace, roleBinding.Name, err)
+				klog.Errorf("delete role binding %s %s %s failed: %v", username, roleBinding.Namespace, roleBinding.Name, err)
 			}
 		} else if length2 < length1 {
-			_, err = k8s.Client().RbacV1().RoleBindings(roleBinding.Namespace).Update(roleBinding)
+			_, err = clientset.ClientSets().K8s().Kubernetes().RbacV1().RoleBindings(roleBinding.Namespace).Update(roleBinding)
 
 			if err != nil {
-				glog.Errorf("update role binding %s %s %s failed: %v", username, roleBinding.Namespace, roleBinding.Name, err)
+				klog.Errorf("update role binding %s %s %s failed: %v", username, roleBinding.Namespace, roleBinding.Name, err)
 			}
 		}
 	}
@@ -677,19 +890,19 @@ func deleteRoleBindings(username string) error {
 		if length2 == 0 {
 			// delete if it's not workspace role binding
 			if isWorkspaceRoleBinding(clusterRoleBinding) {
-				_, err = k8s.Client().RbacV1().ClusterRoleBindings().Update(clusterRoleBinding)
+				_, err = clientset.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Update(clusterRoleBinding)
 			} else {
-				deletePolicy := meta_v1.DeletePropagationForeground
-				err = k8s.Client().RbacV1().ClusterRoleBindings().Delete(clusterRoleBinding.Name, &meta_v1.DeleteOptions{PropagationPolicy: &deletePolicy})
+				deletePolicy := metav1.DeletePropagationBackground
+				err = clientset.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Delete(clusterRoleBinding.Name, &metav1.DeleteOptions{PropagationPolicy: &deletePolicy})
 			}
 			if err != nil {
-				glog.Errorf("update cluster role binding %s failed:%s", clusterRoleBinding.Name, err)
+				klog.Errorf("update cluster role binding %s failed:%s", clusterRoleBinding.Name, err)
 			}
 		} else if length2 < length1 {
-			_, err = k8s.Client().RbacV1().ClusterRoleBindings().Update(clusterRoleBinding)
+			_, err = clientset.ClientSets().K8s().Kubernetes().RbacV1().ClusterRoleBindings().Update(clusterRoleBinding)
 
 			if err != nil {
-				glog.Errorf("update cluster role binding %s failed:%s", clusterRoleBinding.Name, err)
+				klog.Errorf("update cluster role binding %s failed:%s", clusterRoleBinding.Name, err)
 			}
 		}
 
@@ -704,18 +917,19 @@ func isWorkspaceRoleBinding(clusterRoleBinding *rbacv1.ClusterRoleBinding) bool 
 
 func UserCreateCheck(check string) (exist bool, err error) {
 
-	// bind root DN
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return false, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return false, err
+	}
 	defer conn.Close()
 
 	// search for the given username
 	userSearchRequest := ldap.NewSearchRequest(
-		ldapclient.UserSearchBase,
+		client.UserSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		fmt.Sprintf("(&(objectClass=inetOrgPerson)(|(uid=%s)(mail=%s)))", check, check),
 		[]string{"uid", "mail"},
@@ -725,7 +939,7 @@ func UserCreateCheck(check string) (exist bool, err error) {
 	result, err := conn.Search(userSearchRequest)
 
 	if err != nil {
-		glog.Errorln("search user", err)
+		klog.Errorln("search user", err)
 		return false, err
 	}
 
@@ -738,16 +952,18 @@ func CreateUser(user *models.User) (*models.User, error) {
 	user.Password = strings.TrimSpace(user.Password)
 	user.Description = strings.TrimSpace(user.Description)
 
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return nil, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
 	userSearchRequest := ldap.NewSearchRequest(
-		ldapclient.UserSearchBase,
+		client.UserSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		fmt.Sprintf("(&(objectClass=inetOrgPerson)(|(uid=%s)(mail=%s)))", user.Username, user.Email),
 		[]string{"uid", "mail"},
@@ -757,7 +973,7 @@ func CreateUser(user *models.User) (*models.User, error) {
 	result, err := conn.Search(userSearchRequest)
 
 	if err != nil {
-		glog.Errorln("search user", err)
+		klog.Errorln("search user", err)
 		return nil, err
 	}
 
@@ -765,16 +981,16 @@ func CreateUser(user *models.User) (*models.User, error) {
 		return nil, ldap.NewError(ldap.LDAPResultEntryAlreadyExists, fmt.Errorf("username or email already exists"))
 	}
 
-	maxUid, err := getMaxUid(conn)
+	maxUid, err := getMaxUid()
 
 	if err != nil {
-		glog.Errorln("get max uid", err)
+		klog.Errorln("get max uid", err)
 		return nil, err
 	}
 
 	maxUid += 1
 
-	userCreateRequest := ldap.NewAddRequest(fmt.Sprintf("uid=%s,%s", user.Username, ldapclient.UserSearchBase), nil)
+	userCreateRequest := ldap.NewAddRequest(fmt.Sprintf("uid=%s,%s", user.Username, client.UserSearchBase()), nil)
 	userCreateRequest.Attribute("objectClass", []string{"inetOrgPerson", "posixAccount", "top"})
 	userCreateRequest.Attribute("cn", []string{user.Username})                       // RFC4519: common name(s) for which the entity is known by
 	userCreateRequest.Attribute("sn", []string{" "})                                 // RFC2256: last (family) name(s) for which the entity is known by
@@ -791,27 +1007,25 @@ func CreateUser(user *models.User) (*models.User, error) {
 		userCreateRequest.Attribute("description", []string{user.Description}) // RFC4519: descriptive information
 	}
 
-	if err := kubeconfig.CreateKubeConfig(user.Username); err != nil {
-		glog.Errorln("create user kubeconfig failed", user.Username, err)
-		return nil, err
+	if generateKubeConfig {
+		if err = kubeconfig.CreateKubeConfig(user.Username); err != nil {
+			klog.Errorln("create user kubeconfig failed", user.Username, err)
+			return nil, err
+		}
 	}
 
 	err = conn.Add(userCreateRequest)
 
 	if err != nil {
-		glog.Errorln("create user", err)
+		klog.Errorln("create user", err)
 		return nil, err
-	}
-
-	if user.AvatarUrl != "" {
-		setAvatar(user.Username, user.AvatarUrl)
 	}
 
 	if user.ClusterRole != "" {
 		err := CreateClusterRoleBinding(user.Username, user.ClusterRole)
 
 		if err != nil {
-			glog.Errorln("create cluster role binding filed", err)
+			klog.Errorln("create cluster role binding filed", err)
 			return nil, err
 		}
 	}
@@ -819,8 +1033,18 @@ func CreateUser(user *models.User) (*models.User, error) {
 	return DescribeUser(user.Username)
 }
 
-func getMaxUid(conn ldap.Client) (int, error) {
-	userSearchRequest := ldap.NewSearchRequest(ldapclient.UserSearchBase,
+func getMaxUid() (int, error) {
+	client, err := clientset.ClientSets().Ldap()
+	if err != nil {
+		return 0, err
+	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	userSearchRequest := ldap.NewSearchRequest(client.UserSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		"(&(objectClass=inetOrgPerson))",
 		[]string{"uidNumber"},
@@ -848,9 +1072,19 @@ func getMaxUid(conn ldap.Client) (int, error) {
 	return maxUid, nil
 }
 
-func getMaxGid(conn ldap.Client) (int, error) {
+func getMaxGid() (int, error) {
 
-	groupSearchRequest := ldap.NewSearchRequest(ldapclient.GroupSearchBase,
+	client, err := clientset.ClientSets().Ldap()
+	if err != nil {
+		return 0, err
+	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return 0, err
+	}
+	defer conn.Close()
+
+	groupSearchRequest := ldap.NewSearchRequest(client.GroupSearchBase(),
 		ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 		"(&(objectClass=posixGroup))",
 		[]string{"gidNumber"},
@@ -880,20 +1114,21 @@ func getMaxGid(conn ldap.Client) (int, error) {
 
 func UpdateUser(user *models.User) (*models.User, error) {
 
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
-		glog.Error(err)
 		return nil, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
-	dn := fmt.Sprintf("uid=%s,%s", user.Username, ldapclient.UserSearchBase)
+	dn := fmt.Sprintf("uid=%s,%s", user.Username, client.UserSearchBase())
 	userModifyRequest := ldap.NewModifyRequest(dn, nil)
 	if user.Email != "" {
 		userSearchRequest := ldap.NewSearchRequest(
-			ldapclient.UserSearchBase,
+			client.UserSearchBase(),
 			ldap.ScopeWholeSubtree, ldap.NeverDerefAliases, 0, 0, false,
 			fmt.Sprintf("(&(objectClass=inetOrgPerson)(mail=%s))", user.Email),
 			[]string{"uid", "mail"},
@@ -901,17 +1136,17 @@ func UpdateUser(user *models.User) (*models.User, error) {
 		)
 		result, err := conn.Search(userSearchRequest)
 		if err != nil {
-			glog.Error(err)
+			klog.Error(err)
 			return nil, err
 		}
 		if len(result.Entries) > 1 {
 			err = ldap.NewError(ldap.ErrorDebugging, fmt.Errorf("email is duplicated: %s", user.Email))
-			glog.Error(err)
+			klog.Error(err)
 			return nil, err
 		}
 		if len(result.Entries) == 1 && result.Entries[0].GetAttributeValue("uid") != user.Username {
 			err = ldap.NewError(ldap.LDAPResultEntryAlreadyExists, fmt.Errorf("email is duplicated: %s", user.Email))
-			glog.Error(err)
+			klog.Error(err)
 			return nil, err
 		}
 		userModifyRequest.Replace("mail", []string{user.Email})
@@ -928,32 +1163,28 @@ func UpdateUser(user *models.User) (*models.User, error) {
 		userModifyRequest.Replace("userPassword", []string{user.Password})
 	}
 
-	if user.AvatarUrl != "" {
-		err = setAvatar(user.Username, user.AvatarUrl)
-	}
-
-	if err != nil {
-		glog.Error(err)
-		return nil, err
-	}
-
 	err = conn.Modify(userModifyRequest)
 
 	if err != nil {
-		glog.Error(err)
+		klog.Error(err)
 		return nil, err
 	}
 
-	err = CreateClusterRoleBinding(user.Username, user.ClusterRole)
+	if user.ClusterRole != "" {
+		err = CreateClusterRoleBinding(user.Username, user.ClusterRole)
 
-	if err != nil {
-		glog.Errorln("create cluster role binding filed", err)
-		return nil, err
+		if err != nil {
+			klog.Errorln(err)
+			return nil, err
+		}
 	}
 
 	// clear auth failed record
 	if user.Password != "" {
-		redisClient := redis.Client()
+		redisClient, err := clientset.ClientSets().Redis()
+		if err != nil {
+			return nil, err
+		}
 
 		records, err := redisClient.Keys(fmt.Sprintf("kubesphere:authfailed:%s:*", user.Username)).Result()
 
@@ -966,8 +1197,11 @@ func UpdateUser(user *models.User) (*models.User, error) {
 }
 func DeleteGroup(path string) error {
 
-	// bind root DN
-	conn, err := ldapclient.Client()
+	client, err := clientset.ClientSets().Ldap()
+	if err != nil {
+		return err
+	}
+	conn, err := client.NewConn()
 	if err != nil {
 		return err
 	}
@@ -979,7 +1213,7 @@ func DeleteGroup(path string) error {
 	err = conn.Del(groupDeleteRequest)
 
 	if err != nil {
-		glog.Errorln("delete user group", err)
+		klog.Errorln("delete user group", err)
 		return err
 	}
 
@@ -988,18 +1222,20 @@ func DeleteGroup(path string) error {
 
 func CreateGroup(group *models.Group) (*models.Group, error) {
 
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return nil, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
-	maxGid, err := getMaxGid(conn)
+	maxGid, err := getMaxGid()
 
 	if err != nil {
-		glog.Errorln("get max gid", err)
+		klog.Errorln("get max gid", err)
 		return nil, err
 	}
 
@@ -1027,7 +1263,7 @@ func CreateGroup(group *models.Group) (*models.Group, error) {
 	err = conn.Add(groupCreateRequest)
 
 	if err != nil {
-		glog.Errorln("create group", err)
+		klog.Errorln("create group", err)
 		return nil, err
 	}
 
@@ -1038,8 +1274,11 @@ func CreateGroup(group *models.Group) (*models.Group, error) {
 
 func UpdateGroup(group *models.Group) (*models.Group, error) {
 
-	// bind root DN
-	conn, err := ldapclient.Client()
+	client, err := clientset.ClientSets().Ldap()
+	if err != nil {
+		return nil, err
+	}
+	conn, err := client.NewConn()
 	if err != nil {
 		return nil, err
 	}
@@ -1074,7 +1313,7 @@ func UpdateGroup(group *models.Group) (*models.Group, error) {
 	err = conn.Modify(groupUpdateRequest)
 
 	if err != nil {
-		glog.Errorln("update group", err)
+		klog.Errorln("update group", err)
 		return nil, err
 	}
 
@@ -1083,18 +1322,19 @@ func UpdateGroup(group *models.Group) (*models.Group, error) {
 
 func ChildList(path string) ([]models.Group, error) {
 
-	// bind root DN
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return nil, err
 	}
-
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
 	defer conn.Close()
 
 	var groupSearchRequest *ldap.SearchRequest
 	if path == "" {
-		groupSearchRequest = ldap.NewSearchRequest(ldapclient.GroupSearchBase,
+		groupSearchRequest = ldap.NewSearchRequest(client.GroupSearchBase(),
 			ldap.ScopeSingleLevel, ldap.NeverDerefAliases, 0, 0, false,
 			"(&(objectClass=posixGroup))",
 			[]string{"cn", "gidNumber", "memberUid", "description"},
@@ -1153,14 +1393,17 @@ func ChildList(path string) ([]models.Group, error) {
 }
 
 func DescribeGroup(path string) (*models.Group, error) {
-
-	searchBase, cn := splitPath(path)
-
-	conn, err := ldapclient.Client()
-
+	client, err := clientset.ClientSets().Ldap()
 	if err != nil {
 		return nil, err
 	}
+	conn, err := client.NewConn()
+	if err != nil {
+		return nil, err
+	}
+	defer conn.Close()
+
+	searchBase, cn := splitPath(path)
 
 	groupSearchRequest := ldap.NewSearchRequest(searchBase,
 		ldap.ScopeSingleLevel, ldap.NeverDerefAliases, 0, 0, false,
@@ -1171,7 +1414,7 @@ func DescribeGroup(path string) (*models.Group, error) {
 	result, err := conn.Search(groupSearchRequest)
 
 	if err != nil {
-		glog.Errorln("search group", err)
+		klog.Errorln("search group", err)
 		return nil, err
 	}
 

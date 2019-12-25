@@ -18,18 +18,15 @@
 package main
 
 import (
-	"github.com/mholt/caddy/caddy/caddymain"
-	"github.com/mholt/caddy/caddyhttp/httpserver"
-
-	// Install apis
-	_ "kubesphere.io/kubesphere/pkg/apigateway/caddy-plugin/authenticate"
-	_ "kubesphere.io/kubesphere/pkg/apigateway/caddy-plugin/authentication"
-	_ "kubesphere.io/kubesphere/pkg/apigateway/caddy-plugin/swagger"
+	"kubesphere.io/kubesphere/cmd/ks-apigateway/app"
+	"os"
 )
 
 func main() {
-	httpserver.RegisterDevDirective("authenticate", "jwt")
-	httpserver.RegisterDevDirective("authentication", "jwt")
-	httpserver.RegisterDevDirective("swagger", "jwt")
-	caddymain.Run()
+
+	cmd := app.NewAPIGatewayCommand()
+
+	if err := cmd.Execute(); err != nil {
+		os.Exit(1)
+	}
 }

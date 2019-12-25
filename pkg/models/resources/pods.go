@@ -21,7 +21,7 @@ import (
 	appsv1 "k8s.io/api/apps/v1"
 	"kubesphere.io/kubesphere/pkg/constants"
 	"kubesphere.io/kubesphere/pkg/informers"
-	"kubesphere.io/kubesphere/pkg/params"
+	"kubesphere.io/kubesphere/pkg/server/params"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
 	"sort"
 	"strings"
@@ -140,7 +140,7 @@ func podBelongToService(item *v1.Pod, serviceName string) bool {
 	}
 
 	selector := labels.Set(service.Spec.Selector).AsSelectorPreValidated()
-	if !selector.Matches(labels.Set(item.Labels)) {
+	if selector.Empty() || !selector.Matches(labels.Set(item.Labels)) {
 		return false
 	}
 	return true
@@ -221,6 +221,14 @@ func (*podSearcher) fuzzy(fuzzy map[string]string, item *v1.Pod) bool {
 
 func (*podSearcher) compare(a, b *v1.Pod, orderBy string) bool {
 	switch orderBy {
+	case StartTime:
+		if a.Status.StartTime == nil {
+			return false
+		}
+		if b.Status.StartTime == nil {
+			return true
+		}
+		return a.Status.StartTime.Before(b.Status.StartTime)
 	case CreateTime:
 		return a.CreationTimestamp.Time.Before(b.CreationTimestamp.Time)
 	case Name:

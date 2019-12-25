@@ -22,8 +22,8 @@ import (
 	"kubesphere.io/kubesphere/pkg/models/resources"
 	"net/http"
 
-	"kubesphere.io/kubesphere/pkg/errors"
-	"kubesphere.io/kubesphere/pkg/params"
+	"kubesphere.io/kubesphere/pkg/server/errors"
+	"kubesphere.io/kubesphere/pkg/server/params"
 )
 
 func ListNamespacedResources(req *restful.Request, resp *restful.Response) {
@@ -34,14 +34,9 @@ func ListResources(req *restful.Request, resp *restful.Response) {
 	namespace := req.PathParameter("namespace")
 	resourceName := req.PathParameter("resources")
 	conditions, err := params.ParseConditions(req.QueryParameter(params.ConditionsParam))
-	orderBy := req.QueryParameter(params.OrderByParam)
+	orderBy := params.GetStringValueWithDefault(req, params.OrderByParam, resources.CreateTime)
 	limit, offset := params.ParsePaging(req.QueryParameter(params.PagingParam))
 	reverse := params.ParseReverse(req)
-
-	if orderBy == "" {
-		orderBy = resources.CreateTime
-		reverse = true
-	}
 
 	if err != nil {
 		resp.WriteHeaderAndEntity(http.StatusBadRequest, errors.Wrap(err))

@@ -190,7 +190,7 @@ type BranchPipelineRunNodes struct {
 	DisplayName        string        `json:"displayName,omitempty" description:"display name"`
 	DurationInMillis   int           `json:"durationInMillis,omitempty" description:"duration time in millis"`
 	ID                 string        `json:"id,omitempty" description:"id"`
-	Input              Input         `json:"input,omitempty" description:"the action should user input"`
+	Input              *Input        `json:"input,omitempty" description:"the action should user input"`
 	Result             string        `json:"result,omitempty" description:"the result of pipeline run. e.g. SUCCESS. e.g. SUCCESS"`
 	StartTime          string        `json:"startTime,omitempty" description:"the time of start"`
 	State              string        `json:"state,omitempty" description:"run state. e.g. RUNNING"`
@@ -229,7 +229,7 @@ type BranchPipelineRunNodes struct {
 		DisplayName        string      `json:"displayName,omitempty" description:"display name"`
 		DurationInMillis   int         `json:"durationInMillis,omitempty" description:"duration time in millis"`
 		ID                 string      `json:"id,omitempty" description:"id"`
-		Input              Input       `json:"input,omitempty" description:"the action should user input"`
+		Input              *Input      `json:"input,omitempty" description:"the action should user input"`
 		Result             string      `json:"result,omitempty" description:"result"`
 		StartTime          string      `json:"startTime,omitempty" description:"the time of start"`
 		State              string      `json:"state,omitempty" description:"run state. e.g. RUNNING"`
@@ -258,6 +258,19 @@ type SCMOrg struct {
 	Avatar                      string `json:"avatar,omitempty" description:"the url of organization avatar"`
 	JenkinsOrganizationPipeline bool   `json:"jenkinsOrganizationPipeline,omitempty" description:"weather or not already have jenkins pipeline."`
 	Name                        string `json:"name,omitempty" description:"organization name"`
+}
+
+type SCMServer struct {
+	Class string `json:"_class,omitempty" description:"It’s a fully qualified name and is an identifier of the producer of this resource's capability."`
+	Links struct {
+		Self struct {
+			Class string `json:"_class,omitempty" description:"It’s a fully qualified name and is an identifier of the producer of this resource's capability."`
+			Href  string `json:"href,omitempty" description:"self url in api"`
+		} `json:"self,omitempty" description:"scm server self info"`
+	} `json:"_links,omitempty" description:"references the reachable path to this resource"`
+	ID     string `json:"id,omitempty" description:"server id of scm server"`
+	Name   string `json:"name,omitempty" description:"name of scm server"`
+	ApiURL string `json:"apiUrl,omitempty"  description:"url of scm server"`
 }
 
 // GetOrgRepo
@@ -667,7 +680,7 @@ type NodeStatus struct {
 	DisplayName        string        `json:"displayName,omitempty" description:"display name"`
 	DurationInMillis   int           `json:"durationInMillis,omitempty" description:"duration time in millis"`
 	ID                 string        `json:"id,omitempty" description:"id"`
-	Input              Input         `json:"input,omitempty" description:"the action should user input"`
+	Input              *Input        `json:"input,omitempty" description:"the action should user input"`
 	Result             string        `json:"result,omitempty" description:"the result of pipeline run. e.g. SUCCESS"`
 	StartTime          string        `json:"startTime,omitempty" description:"the time of start"`
 	State              string        `json:"state,omitempty" description:"run state. e.g. RUNNING"`
@@ -706,7 +719,7 @@ type NodeStatus struct {
 		DisplayName        string      `json:"displayName,omitempty" description:"display name"`
 		DurationInMillis   int         `json:"durationInMillis,omitempty" description:"duration time in millis"`
 		ID                 string      `json:"id,omitempty" description:"id"`
-		Input              Input       `json:"input,omitempty" description:"the action should user input"`
+		Input              *Input      `json:"input,omitempty" description:"the action should user input"`
 		Result             string      `json:"result,omitempty" description:"the result of pipeline run. e.g. SUCCESS"`
 		StartTime          string      `json:"startTime,omitempty" description:"the time of start"`
 		State              string      `json:"state,omitempty" description:"run state. e.g. RUNNING"`
@@ -721,9 +734,14 @@ type CheckPlayload struct {
 	Abort      bool                      `json:"abort,omitempty" description:"abort or not"`
 }
 
+type CreateScmServerReq struct {
+	Name   string `json:"name,omitempty" description:"name of scm server"`
+	ApiURL string `json:"apiUrl,omitempty"  description:"url of scm server"`
+}
+
 type CheckPlayloadParameters struct {
-	Name  string `json:"name,omitempty" description:"name"`
-	Value string `json:"value,omitempty" description:"value"`
+	Name  string      `json:"name,omitempty" description:"name"`
+	Value interface{} `json:"value,omitempty" description:"value"`
 }
 
 // Getcrumb
@@ -737,14 +755,21 @@ type Crumb struct {
 type CheckScript struct {
 	Column  int    `json:"column,omitempty" description:"column e.g. 0"`
 	Line    int    `json:"line,omitempty" description:"line e.g. 0"`
-	Message string `json:"message,omitempty" description:"message e.g. success"`
-	Status  string `json:"status,omitempty" description:"status e.g. success"`
+	Message string `json:"message,omitempty" description:"message e.g. unexpected char: '#'"`
+	Status  string `json:"status,omitempty" description:"status e.g. fail"`
 }
 
 // CheckCron
+type CronData struct {
+	PipelineName string `json:"pipelineName,omitempty" description:"Pipeline name, if pipeline haven't created, not required'"`
+	Cron         string `json:"cron" description:"Cron script data."`
+}
+
 type CheckCronRes struct {
-	Result  string `json:"result,omitempty" description:"result"`
-	Message string `json:"message,omitempty" description:"message"`
+	Result   string `json:"result,omitempty" description:"result e.g. ok, error"`
+	Message  string `json:"message,omitempty" description:"message"`
+	LastTime string `json:"lastTime,omitempty" description:"last run time."`
+	NextTime string `json:"nextTime,omitempty" description:"next run time."`
 }
 
 // GetPipelineRun
@@ -970,7 +995,7 @@ type PipelineRunNodes struct {
 	DisplayName        string        `json:"displayName,omitempty" description:"display name"`
 	DurationInMillis   int           `json:"durationInMillis,omitempty" description:"duration time in mullis"`
 	ID                 string        `json:"id,omitempty" description:"id"`
-	Input              Input         `json:"input,omitempty" description:"the action should user input"`
+	Input              *Input        `json:"input,omitempty" description:"the action should user input"`
 	Result             string        `json:"result,omitempty" description:"the result of pipeline run. e.g. SUCCESS"`
 	StartTime          string        `json:"startTime,omitempty" description:"the time of start"`
 	State              string        `json:"state,omitempty" description:"run state. e.g. FINISHED"`
@@ -1008,7 +1033,7 @@ type NodeSteps struct {
 	DisplayName        string `json:"displayName,omitempty" description:"display name"`
 	DurationInMillis   int    `json:"durationInMillis,omitempty" description:"duration time in mullis"`
 	ID                 string `json:"id,omitempty" description:"id"`
-	Input              Input  `json:"input,omitempty" description:"the action should user input"`
+	Input              *Input `json:"input,omitempty" description:"the action should user input"`
 	Result             string `json:"result,omitempty" description:"the result of pipeline run. e.g. SUCCESS"`
 	StartTime          string `json:"startTime,omitempty" description:"the time of starts"`
 	State              string `json:"state,omitempty" description:"run state. e.g. SKIPPED"`
@@ -1017,7 +1042,7 @@ type NodeSteps struct {
 
 // CheckScriptCompile
 type ReqScript struct {
-	Value string `json:"value,omitempty" description:"check value"`
+	Value string `json:"value,omitempty" description:"Pipeline script data"`
 }
 
 // ToJenkinsfile requests
@@ -1085,7 +1110,7 @@ type NodesDetail struct {
 	DisplayName        string        `json:"displayName,omitempty" description:"display name"`
 	DurationInMillis   int           `json:"durationInMillis,omitempty" description:"duration time in millis"`
 	ID                 string        `json:"id,omitempty" description:"id"`
-	Input              Input         `json:"input,omitempty" description:"the action should user input"`
+	Input              *Input        `json:"input,omitempty" description:"the action should user input"`
 	Result             string        `json:"result,omitempty" description:"the result of pipeline run. e.g. SUCCESS"`
 	StartTime          string        `json:"startTime,omitempty" description:"the time of start"`
 	State              string        `json:"state,omitempty" description:"run state. e.g. SKIPPED"`
@@ -1108,8 +1133,8 @@ type NodesStepsIndex struct {
 
 type Input struct {
 	Class string `json:"_class,omitempty" description:"It’s a fully qualified name and is an identifier of the producer of this resource's capability."`
-	Links struct {
-		Self struct {
+	Links *struct {
+		Self *struct {
 			Class string `json:"_class,omitempty"`
 			Href  string `json:"href,omitempty"`
 		} `json:"self,omitempty"`

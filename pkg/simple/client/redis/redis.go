@@ -18,48 +18,53 @@
 package redis
 
 import (
-	"flag"
-	"log"
-	"os"
-	"os/signal"
-	"sync"
-	"syscall"
-
 	"github.com/go-redis/redis"
+	"k8s.io/klog"
 )
 
-var (
-	redisHost       string
-	redisPassword   string
-	redisDB         int
-	redisClientOnce sync.Once
-	redisClient     *redis.Client
-)
-
-func init() {
-	flag.StringVar(&redisHost, "redis-server", "localhost:6379", "redis server host")
-	flag.StringVar(&redisPassword, "redis-password", "", "redis password")
-	flag.IntVar(&redisDB, "redis-db", 0, "redis db")
+type RedisClient struct {
+	client *redis.Client
 }
 
-func Client() *redis.Client {
+func NewRedisClientOrDie(options *RedisOptions, stopCh <-chan struct{}) *RedisClient {
+	client, err := NewRedisClient(options, stopCh)
+	if err != nil {
+		panic(err)
+	}
 
-	redisClientOnce.Do(func() {
-		redisClient = redis.NewClient(&redis.Options{
-			Addr:     redisHost,
-			Password: redisPassword,
-			DB:       redisDB,
-		})
-		if err := redisClient.Ping().Err(); err != nil {
-			log.Fatalln(err)
-		}
-		c := make(chan os.Signal, 0)
-		signal.Notify(c, os.Interrupt, syscall.SIGTERM)
+	return client
+}
+
+func NewRedisClient(option *RedisOptions, stopCh <-chan struct{}) (*RedisClient, error) {
+	var r RedisClient
+
+	options, err := redis.ParseURL(option.RedisURL)
+
+	if err != nil {
+		klog.Error(err)
+		return nil, err
+	}
+
+	r.client = redis.NewClient(options)
+
+	if err := r.client.Ping().Err(); err != nil {
+		klog.Error("unable to reach redis host", err)
+		r.client.Close()
+		return nil, err
+	}
+
+	if stopCh != nil {
 		go func() {
-			<-c
-			redisClient.Close()
+			<-stopCh
+			if err := r.client.Close(); err != nil {
+				klog.Error(err)
+			}
 		}()
-	})
+	}
 
-	return redisClient
+	return &r, nil
+}
+
+func (r *RedisClient) Redis() *redis.Client {
+	return r.client
 }

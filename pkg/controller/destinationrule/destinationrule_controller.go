@@ -4,7 +4,8 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/knative/pkg/apis/istio/v1alpha3"
+	apinetworkingv1alpha3 "istio.io/api/networking/v1alpha3"
+	clientgonetworkingv1alpha3 "istio.io/client-go/pkg/apis/networking/v1alpha3"
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -16,16 +17,15 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes/scheme"
 	v1core "k8s.io/client-go/kubernetes/typed/core/v1"
-	"k8s.io/kubernetes/pkg/util/metrics"
+	log "k8s.io/klog"
 	servicemeshv1alpha2 "kubesphere.io/kubesphere/pkg/apis/servicemesh/v1alpha2"
 	"kubesphere.io/kubesphere/pkg/controller/virtualservice/util"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 
 	"time"
 
-	istioclientset "github.com/knative/pkg/client/clientset/versioned"
-	istioinformers "github.com/knative/pkg/client/informers/externalversions/istio/v1alpha3"
-	istiolisters "github.com/knative/pkg/client/listers/istio/v1alpha3"
+	istioclientset "istio.io/client-go/pkg/clientset/versioned"
+	istioinformers "istio.io/client-go/pkg/informers/externalversions/networking/v1alpha3"
+	istiolisters "istio.io/client-go/pkg/listers/networking/v1alpha3"
 	informersv1 "k8s.io/client-go/informers/apps/v1"
 	coreinformers "k8s.io/client-go/informers/core/v1"
 	clientset "k8s.io/client-go/kubernetes"
@@ -48,8 +48,6 @@ const (
 	// 5ms, 10ms, 20ms, 40ms, 80ms, 160ms, 320ms, 640ms, 1.3s, 2.6s, 5.1s, 10.2s, 20.4s, 41s, 82s
 	maxRetries = 15
 )
-
-var log = logf.Log.WithName("destinationrule-controller")
 
 type DestinationRuleController struct {
 	client clientset.Interface
@@ -91,10 +89,6 @@ func NewDestinationRuleController(deploymentInformer informersv1.DeploymentInfor
 	})
 	broadcaster.StartRecordingToSink(&v1core.EventSinkImpl{Interface: client.CoreV1().Events("")})
 	recorder := broadcaster.NewRecorder(scheme.Scheme, v1.EventSource{Component: "destinationrule-controller"})
-
-	if client != nil && client.CoreV1().RESTClient().GetRateLimiter() != nil {
-		metrics.RegisterMetricAndTrackRateLimiterUsage("virtualservice_controller", client.CoreV1().RESTClient().GetRateLimiter())
-	}
 
 	v := &DestinationRuleController{
 		client:                client,
@@ -251,7 +245,7 @@ func (v *DestinationRuleController) syncService(key string) error {
 		return err
 	}
 
-	subsets := make([]v1alpha3.Subset, 0)
+	subsets := make([]*apinetworkingv1alpha3.Subset, 0)
 	for _, deployment := range deployments {
 
 		// not a valid deployment we required
@@ -269,7 +263,7 @@ func (v *DestinationRuleController) syncService(key string) error {
 			continue
 		}
 
-		subset := v1alpha3.Subset{
+		subset := &apinetworkingv1alpha3.Subset{
 			Name: util.NormalizeVersionName(version),
 			Labels: map[string]string{
 				util.VersionLabel: version,
@@ -282,12 +276,12 @@ func (v *DestinationRuleController) syncService(key string) error {
 	currentDestinationRule, err := v.destinationRuleLister.DestinationRules(namespace).Get(name)
 	if err != nil {
 		if errors.IsNotFound(err) {
-			currentDestinationRule = &v1alpha3.DestinationRule{
+			currentDestinationRule = &clientgonetworkingv1alpha3.DestinationRule{
 				ObjectMeta: metav1.ObjectMeta{
 					Name:   service.Name,
 					Labels: service.Labels,
 				},
-				Spec: v1alpha3.DestinationRuleSpec{
+				Spec: apinetworkingv1alpha3.DestinationRule{
 					Host: name,
 				},
 			}
@@ -473,7 +467,7 @@ func (v *DestinationRuleController) addServicePolicy(obj interface{}) {
 }
 
 func (v *DestinationRuleController) handleErr(err error, key interface{}) {
-	if err != nil {
+	if err == nil {
 		v.queue.Forget(key)
 		return
 	}

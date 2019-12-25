@@ -22,7 +22,6 @@ import (
 	"fmt"
 	"reflect"
 
-	"github.com/golang/glog"
 	batchv1 "k8s.io/api/batch/v1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
@@ -30,9 +29,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/wait"
 	batchv1informers "k8s.io/client-go/informers/batch/v1"
 	batchv1listers "k8s.io/client-go/listers/batch/v1"
-	"k8s.io/kubernetes/pkg/util/metrics"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
-
+	log "k8s.io/klog"
 	"time"
 
 	clientset "k8s.io/client-go/kubernetes"
@@ -51,8 +48,6 @@ const (
 	revisionsAnnotationKey = "revisions"
 )
 
-var log = logf.Log.WithName("job-controller")
-
 type JobController struct {
 	client           clientset.Interface
 	eventBroadcaster record.EventBroadcaster
@@ -67,11 +62,6 @@ type JobController struct {
 }
 
 func NewJobController(jobInformer batchv1informers.JobInformer, client clientset.Interface) *JobController {
-
-	if client != nil && client.CoreV1().RESTClient().GetRateLimiter() != nil {
-		metrics.RegisterMetricAndTrackRateLimiterUsage("job_controller", client.CoreV1().RESTClient().GetRateLimiter())
-	}
-
 	v := &JobController{
 		client:           client,
 		queue:            workqueue.NewNamedRateLimitingQueue(workqueue.DefaultControllerRateLimiter(), "job"),
@@ -173,6 +163,7 @@ func (v *JobController) syncJob(key string) error {
 
 	if err != nil {
 		log.Error(err, "make job revision failed", "namespace", namespace, "name", name)
+		return err
 	}
 
 	return nil
@@ -189,7 +180,7 @@ func (v *JobController) addJob(obj interface{}) {
 }
 
 func (v *JobController) handleErr(err error, key interface{}) {
-	if err != nil {
+	if err == nil {
 		v.queue.Forget(key)
 		return
 	}
@@ -235,7 +226,7 @@ func (v *JobController) makeRevision(job *batchv1.Job) error {
 
 	revisionsByte, err := json.Marshal(revisions)
 	if err != nil {
-		glog.Error("generate reversion string failed", err)
+		log.Error("generate reversion string failed", err)
 		return nil
 	}
 

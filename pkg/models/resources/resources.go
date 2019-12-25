@@ -19,9 +19,9 @@ package resources
 
 import (
 	"fmt"
-	"github.com/golang/glog"
+	"k8s.io/klog"
 	"kubesphere.io/kubesphere/pkg/models"
-	"kubesphere.io/kubesphere/pkg/params"
+	"kubesphere.io/kubesphere/pkg/server/params"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
 	"strings"
 )
@@ -41,6 +41,8 @@ func init() {
 	resources[Roles] = &roleSearcher{}
 	resources[S2iBuilders] = &s2iBuilderSearcher{}
 	resources[S2iRuns] = &s2iRunSearcher{}
+	resources[HorizontalPodAutoscalers] = &hpaSearcher{}
+	resources[Applications] = &appSearcher{}
 
 	resources[Nodes] = &nodeSearcher{}
 	resources[Namespaces] = &namespaceSearcher{}
@@ -57,55 +59,63 @@ var (
 )
 
 const (
-	Name                   = "name"
-	Label                  = "label"
-	OwnerKind              = "ownerKind"
-	OwnerName              = "ownerName"
-	Role                   = "role"
-	CreateTime             = "createTime"
-	UpdateTime             = "updateTime"
-	LastScheduleTime       = "lastScheduleTime"
-	chart                  = "chart"
-	release                = "release"
-	annotation             = "annotation"
-	Keyword                = "keyword"
-	Status                 = "status"
-	includeCronJob         = "includeCronJob"
-	storageClassName       = "storageClassName"
-	cronJobKind            = "CronJob"
-	s2iRunKind             = "S2iRun"
-	includeS2iRun          = "includeS2iRun"
-	StatusRunning          = "running"
-	StatusPaused           = "paused"
-	StatusPending          = "pending"
-	StatusUpdating         = "updating"
-	StatusStopped          = "stopped"
-	StatusFailed           = "failed"
-	StatusBound            = "bound"
-	StatusLost             = "lost"
-	StatusComplete         = "complete"
-	app                    = "app"
-	Deployments            = "deployments"
-	DaemonSets             = "daemonsets"
-	Roles                  = "roles"
-	Workspaces             = "workspaces"
-	WorkspaceRoles         = "workspaceroles"
-	CronJobs               = "cronjobs"
-	ConfigMaps             = "configmaps"
-	Ingresses              = "ingresses"
-	Jobs                   = "jobs"
-	PersistentVolumeClaims = "persistentvolumeclaims"
-	Pods                   = "pods"
-	Secrets                = "secrets"
-	Services               = "services"
-	StatefulSets           = "statefulsets"
-	Nodes                  = "nodes"
-	Namespaces             = "namespaces"
-	StorageClasses         = "storageclasses"
-	ClusterRoles           = "clusterroles"
-	S2iBuilderTemplates    = "s2ibuildertemplates"
-	S2iBuilders            = "s2ibuilders"
-	S2iRuns                = "s2iruns"
+	Name                     = "name"
+	Label                    = "label"
+	OwnerKind                = "ownerKind"
+	OwnerName                = "ownerName"
+	TargetKind               = "targetKind"
+	TargetName               = "targetName"
+	Role                     = "role"
+	CreateTime               = "createTime"
+	UpdateTime               = "updateTime"
+	StartTime                = "startTime"
+	LastScheduleTime         = "lastScheduleTime"
+	chart                    = "chart"
+	release                  = "release"
+	annotation               = "annotation"
+	Keyword                  = "keyword"
+	UserFacing               = "userfacing"
+	Status                   = "status"
+	includeCronJob           = "includeCronJob"
+	storageClassName         = "storageClassName"
+	cronJobKind              = "CronJob"
+	s2iRunKind               = "S2iRun"
+	includeS2iRun            = "includeS2iRun"
+	StatusRunning            = "running"
+	StatusPaused             = "paused"
+	StatusPending            = "pending"
+	StatusUpdating           = "updating"
+	StatusStopped            = "stopped"
+	StatusFailed             = "failed"
+	StatusBound              = "bound"
+	StatusLost               = "lost"
+	StatusComplete           = "complete"
+	StatusWarning            = "warning"
+	StatusUnschedulable      = "unschedulable"
+	app                      = "app"
+	Deployments              = "deployments"
+	DaemonSets               = "daemonsets"
+	Roles                    = "roles"
+	Workspaces               = "workspaces"
+	WorkspaceRoles           = "workspaceroles"
+	CronJobs                 = "cronjobs"
+	ConfigMaps               = "configmaps"
+	Ingresses                = "ingresses"
+	Jobs                     = "jobs"
+	PersistentVolumeClaims   = "persistentvolumeclaims"
+	Pods                     = "pods"
+	Secrets                  = "secrets"
+	Services                 = "services"
+	StatefulSets             = "statefulsets"
+	HorizontalPodAutoscalers = "horizontalpodautoscalers"
+	Applications             = "applications"
+	Nodes                    = "nodes"
+	Namespaces               = "namespaces"
+	StorageClasses           = "storageclasses"
+	ClusterRoles             = "clusterroles"
+	S2iBuilderTemplates      = "s2ibuildertemplates"
+	S2iBuilders              = "s2ibuilders"
+	S2iRuns                  = "s2iruns"
 )
 
 type resourceSearchInterface interface {
@@ -117,12 +127,12 @@ func GetResource(namespace, resource, name string) (interface{}, error) {
 	if searcher, ok := resources[resource]; ok {
 		resource, err := searcher.get(namespace, name)
 		if err != nil {
-			glog.Errorln("get resource", namespace, resource, name, err)
+			klog.Errorf("resource %s.%s.%s not found: %s", namespace, resource, name, err)
 			return nil, err
 		}
 		return resource, nil
 	}
-	return nil, fmt.Errorf("resource %s not found", resource)
+	return nil, fmt.Errorf("resource %s.%s.%s not found", namespace, resource, name)
 }
 
 func ListResources(namespace, resource string, conditions *params.Conditions, orderBy string, reverse bool, limit, offset int) (*models.PageableResponse, error) {
@@ -132,26 +142,31 @@ func ListResources(namespace, resource string, conditions *params.Conditions, or
 
 	// none namespace resource
 	if namespace != "" && sliceutil.HasString(clusterResources, resource) {
-		glog.Errorln("resources not found", resource)
-		return nil, fmt.Errorf("not found")
+		err = fmt.Errorf("namespaced resource %s not found", resource)
+		klog.Errorln(err)
+		return nil, err
 	}
 
 	if searcher, ok := resources[resource]; ok {
 		result, err = searcher.search(namespace, conditions, orderBy, reverse)
 	} else {
-		glog.Errorln("resources not found", resource)
-		return nil, fmt.Errorf("not found")
-	}
-
-	if err != nil {
-		glog.Errorln("resources search", err)
+		err = fmt.Errorf("namespaced resource %s not found", resource)
+		klog.Errorln(err)
 		return nil, err
 	}
 
-	for i, item := range result {
-		if i >= offset && (limit == -1 || len(items) < limit) {
-			items = append(items, injector.addExtraAnnotations(item))
-		}
+	if err != nil {
+		klog.Errorln(err)
+		return nil, err
+	}
+
+	if limit == -1 || limit+offset > len(result) {
+		limit = len(result) - offset
+	}
+
+	result = result[offset : offset+limit]
+	for _, item := range result {
+		items = append(items, injector.addExtraAnnotations(item))
 	}
 
 	return &models.PageableResponse{TotalCount: len(result), Items: items}, nil

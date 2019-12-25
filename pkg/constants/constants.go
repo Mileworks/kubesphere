@@ -28,6 +28,7 @@ const (
 	KubeSphereLoggingNamespace    = "kubesphere-logging-system"
 	KubeSphereNamespace           = "kubesphere-system"
 	KubeSphereControlNamespace    = "kubesphere-controls-system"
+	PorterNamespace               = "porter-system"
 	IngressControllerNamespace    = KubeSphereControlNamespace
 	AdminUserName                 = "admin"
 	DataHome                      = "/etc/kubesphere"
@@ -35,15 +36,16 @@ const (
 	IngressControllerPrefix       = "kubesphere-router-"
 
 	WorkspaceLabelKey              = "kubesphere.io/workspace"
-	DisplayNameAnnotationKey       = "displayName"
-	DescriptionAnnotationKey       = "desc"
-	CreatorAnnotationKey           = "creator"
+	DisplayNameAnnotationKey       = "kubesphere.io/alias-name"
+	DescriptionAnnotationKey       = "kubesphere.io/description"
+	CreatorAnnotationKey           = "kubesphere.io/creator"
 	System                         = "system"
 	OpenPitrixRuntimeAnnotationKey = "openpitrix_runtime"
 	WorkspaceAdmin                 = "workspace-admin"
 	ClusterAdmin                   = "cluster-admin"
 	WorkspaceRegular               = "workspace-regular"
 	WorkspaceViewer                = "workspace-viewer"
+	WorkspacesManager              = "workspaces-manager"
 	DevopsOwner                    = "owner"
 	DevopsReporter                 = "reporter"
 
@@ -55,7 +57,9 @@ const (
 	NamespaceResourcesTag      = "Namespace Resources"
 	ClusterResourcesTag        = "Cluster Resources"
 	ComponentStatusTag         = "Component Status"
+	OpenpitrixTag              = "Openpitrix Resources"
 	VerificationTag            = "Verification"
+	RegistryTag                = "Docker Registry"
 	UserResourcesTag           = "User Resources"
 	DevOpsProjectTag           = "DevOps Project"
 	DevOpsProjectCredentialTag = "DevOps Project Credential"
@@ -68,6 +72,7 @@ const (
 	NodeMetricsTag             = "Node Metrics"
 	NamespaceMetricsTag        = "Namespace Metrics"
 	PodMetricsTag              = "Pod Metrics"
+	PVCMetricsTag              = "PVC Metrics"
 	ContainerMetricsTag        = "Container Metrics"
 	WorkloadMetricsTag         = "Workload Metrics"
 	WorkspaceMetricsTag        = "Workspace Metrics"
@@ -78,5 +83,5 @@ const (
 
 var (
 	WorkSpaceRoles   = []string{WorkspaceAdmin, WorkspaceRegular, WorkspaceViewer}
-	SystemNamespaces = []string{KubeSphereNamespace, KubeSphereLoggingNamespace, KubeSphereMonitoringNamespace, OpenPitrixNamespace, KubeSystemNamespace, IstioNamespace, KubesphereDevOpsNamespace}
+	SystemNamespaces = []string{KubeSphereNamespace, KubeSphereLoggingNamespace, KubeSphereMonitoringNamespace, OpenPitrixNamespace, KubeSystemNamespace, IstioNamespace, KubesphereDevOpsNamespace, PorterNamespace}
 )

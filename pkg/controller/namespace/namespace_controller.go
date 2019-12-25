@@ -21,22 +21,22 @@ package namespace
 import (
 	"context"
 	"fmt"
-	"github.com/golang/glog"
+	"github.com/golang/protobuf/ptypes/wrappers"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	rbac "k8s.io/api/rbac/v1"
-	"k8s.io/api/storage/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"k8s.io/kubernetes/pkg/apis/core"
+	"k8s.io/klog"
 	"kubesphere.io/kubesphere/pkg/apis/tenant/v1alpha1"
 	"kubesphere.io/kubesphere/pkg/constants"
+	cs "kubesphere.io/kubesphere/pkg/simple/client"
 	"kubesphere.io/kubesphere/pkg/simple/client/openpitrix"
 	"kubesphere.io/kubesphere/pkg/utils/k8sutil"
 	"kubesphere.io/kubesphere/pkg/utils/sliceutil"
-	"math"
+	"openpitrix.io/openpitrix/pkg/pb"
 	"reflect"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller"
@@ -44,9 +44,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/manager"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
-	logf "sigs.k8s.io/controller-runtime/pkg/runtime/log"
 	"sigs.k8s.io/controller-runtime/pkg/source"
-	"time"
 )
 
 const (
@@ -56,13 +54,13 @@ const (
 )
 
 var (
-	log          = logf.Log.WithName("namespace-controller")
-	defaultRoles = []rbac.Role{
-		{ObjectMeta: metav1.ObjectMeta{Name: "admin", Annotations: map[string]string{constants.DescriptionAnnotationKey: adminDescription, constants.CreatorAnnotationKey: constants.System}}, Rules: []rbac.PolicyRule{{Verbs: []string{"*"}, APIGroups: []string{"*"}, Resources: []string{"*"}}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "operator", Annotations: map[string]string{constants.DescriptionAnnotationKey: operatorDescription, constants.CreatorAnnotationKey: constants.System}}, Rules: []rbac.PolicyRule{{Verbs: []string{"get", "list", "watch"}, APIGroups: []string{"*"}, Resources: []string{"*"}},
-			{Verbs: []string{"*"}, APIGroups: []string{"", "apps", "extensions", "batch", "logging.kubesphere.io", "monitoring.kubesphere.io", "iam.kubesphere.io", "resources.kubesphere.io", "autoscaling", "alerting.kubesphere.io", "app.k8s.io", "servicemesh.kubesphere.io", "operations.kubesphere.io"}, Resources: []string{"*"}}}},
-		{ObjectMeta: metav1.ObjectMeta{Name: "viewer", Annotations: map[string]string{constants.DescriptionAnnotationKey: viewerDescription, constants.CreatorAnnotationKey: constants.System}}, Rules: []rbac.PolicyRule{{Verbs: []string{"get", "list", "watch"}, APIGroups: []string{"*"}, Resources: []string{"*"}}}},
-	}
+	admin    = rbac.Role{ObjectMeta: metav1.ObjectMeta{Name: "admin", Annotations: map[string]string{constants.DescriptionAnnotationKey: adminDescription, constants.CreatorAnnotationKey: constants.System}}, Rules: []rbac.PolicyRule{{Verbs: []string{"*"}, APIGroups: []string{"*"}, Resources: []string{"*"}}}}
+	operator = rbac.Role{ObjectMeta: metav1.ObjectMeta{Name: "operator", Annotations: map[string]string{constants.DescriptionAnnotationKey: operatorDescription, constants.CreatorAnnotationKey: constants.System}}, Rules: []rbac.PolicyRule{{Verbs: []string{"get", "list", "watch"}, APIGroups: []string{"*"}, Resources: []string{"*"}},
+		{Verbs: []string{"*"}, APIGroups: []string{"apps", "extensions", "batch", "logging.kubesphere.io", "monitoring.kubesphere.io", "iam.kubesphere.io", "autoscaling", "alerting.kubesphere.io", "openpitrix.io", "app.k8s.io", "servicemesh.kubesphere.io", "operations.kubesphere.io", "devops.kubesphere.io"}, Resources: []string{"*"}},
+		{Verbs: []string{"*"}, APIGroups: []string{"", "resources.kubesphere.io"}, Resources: []string{"jobs", "cronjobs", "daemonsets", "deployments", "horizontalpodautoscalers", "ingresses", "endpoints", "configmaps", "events", "persistentvolumeclaims", "pods", "podtemplates", "pods", "secrets", "services"}},
+	}}
+	viewer       = rbac.Role{ObjectMeta: metav1.ObjectMeta{Name: "viewer", Annotations: map[string]string{constants.DescriptionAnnotationKey: viewerDescription, constants.CreatorAnnotationKey: constants.System}}, Rules: []rbac.PolicyRule{{Verbs: []string{"get", "list", "watch"}, APIGroups: []string{"*"}, Resources: []string{"*"}}}}
+	defaultRoles = []rbac.Role{admin, operator, viewer}
 )
 
 /**
@@ -141,12 +139,14 @@ func (r *ReconcileNamespace) Reconcile(request reconcile.Request) (reconcile.Res
 	} else {
 		// The object is being deleted
 		if sliceutil.HasString(instance.ObjectMeta.Finalizers, finalizer) {
-			if err := r.deleteRouter(instance.Name); err != nil {
+			if err = r.deleteRouter(instance.Name); err != nil {
 				return reconcile.Result{}, err
 			}
 
-			// delete runtime in the background, retry 3 times
-			go r.deleteRuntime(instance)
+			// delete runtime
+			if err = r.deleteRuntime(instance); err != nil {
+				return reconcile.Result{}, err
+			}
 
 			// remove our finalizer from the list and update it.
 			instance.ObjectMeta.Finalizers = sliceutil.RemoveString(instance.ObjectMeta.Finalizers, func(item string) bool {
@@ -162,27 +162,17 @@ func (r *ReconcileNamespace) Reconcile(request reconcile.Request) (reconcile.Res
 		return reconcile.Result{}, nil
 	}
 
-	workspaceName := instance.Labels[constants.WorkspaceLabelKey]
+	controlledByWorkspace, err := r.isControlledByWorkspace(instance)
 
-	// delete default role bindings
-	if workspaceName == "" {
-		adminBinding := &rbac.RoleBinding{}
-		adminBinding.Name = "admin"
-		adminBinding.Namespace = instance.Name
-		log.Info("Deleting default role binding", "namespace", instance.Name, "name", adminBinding.Name)
-		err := r.Delete(context.TODO(), adminBinding)
-		if err != nil && !errors.IsNotFound(err) {
-			return reconcile.Result{}, err
-		}
-		viewerBinding := &rbac.RoleBinding{}
-		viewerBinding.Name = "viewer"
-		viewerBinding.Namespace = instance.Name
-		log.Info("Deleting default role binding", "namespace", instance.Name, "name", viewerBinding.Name)
-		err = r.Delete(context.TODO(), viewerBinding)
-		if err != nil && !errors.IsNotFound(err) {
-			return reconcile.Result{}, err
-		}
-		return reconcile.Result{}, nil
+	if err != nil {
+		return reconcile.Result{}, err
+	}
+
+	if !controlledByWorkspace {
+
+		err = r.deleteRoleBindings(instance)
+
+		return reconcile.Result{}, err
 	}
 
 	if err = r.checkAndBindWorkspace(instance); err != nil {
@@ -197,15 +187,23 @@ func (r *ReconcileNamespace) Reconcile(request reconcile.Request) (reconcile.Res
 		return reconcile.Result{}, err
 	}
 
-	if err = r.checkAndCreateCephSecret(instance); err != nil {
-		return reconcile.Result{}, err
-	}
-
 	if err := r.checkAndCreateRuntime(instance); err != nil {
 		return reconcile.Result{}, err
 	}
 
 	return reconcile.Result{}, nil
+}
+
+func (r *ReconcileNamespace) isControlledByWorkspace(namespace *corev1.Namespace) (bool, error) {
+
+	workspaceName := namespace.Labels[constants.WorkspaceLabelKey]
+
+	// without workspace label
+	if workspaceName == "" {
+		return false, nil
+	}
+
+	return true, nil
 }
 
 // Create default roles
@@ -217,14 +215,20 @@ func (r *ReconcileNamespace) checkAndCreateRoles(namespace *corev1.Namespace) er
 			if errors.IsNotFound(err) {
 				role := role.DeepCopy()
 				role.Namespace = namespace.Name
-				log.Info("Creating default role", "namespace", namespace.Name, "role", role.Name)
 				err = r.Create(context.TODO(), role)
 				if err != nil {
-					log.Info("Creating default role failed", "namespace", namespace.Name, "role", role.Name)
+					klog.Error(err)
 					return err
 				}
 			} else {
-				log.Info("Get default role failed", "namespace", namespace.Name, "role", role.Name)
+				klog.Error(err)
+				return err
+			}
+		}
+		if !reflect.DeepEqual(found.Rules, role.Rules) {
+			found.Rules = role.Rules
+			if err := r.Update(context.TODO(), found); err != nil {
+				klog.Error(err)
 				return err
 			}
 		}
@@ -248,9 +252,9 @@ func (r *ReconcileNamespace) checkAndCreateRoleBindings(namespace *corev1.Namesp
 	}
 
 	adminBinding := &rbac.RoleBinding{}
-	adminBinding.Name = "admin"
+	adminBinding.Name = admin.Name
 	adminBinding.Namespace = namespace.Name
-	adminBinding.RoleRef = rbac.RoleRef{Name: "admin", APIGroup: "rbac.authorization.k8s.io", Kind: "Role"}
+	adminBinding.RoleRef = rbac.RoleRef{Name: admin.Name, APIGroup: "rbac.authorization.k8s.io", Kind: "Role"}
 	adminBinding.Subjects = workspaceAdminBinding.Subjects
 
 	if creator.Name != "" {
@@ -267,30 +271,33 @@ func (r *ReconcileNamespace) checkAndCreateRoleBindings(namespace *corev1.Namesp
 	err = r.Get(context.TODO(), types.NamespacedName{Namespace: namespace.Name, Name: adminBinding.Name}, found)
 
 	if errors.IsNotFound(err) {
-		log.Info("Creating default role binding", "namespace", namespace.Name, "name", adminBinding.Name)
 		err = r.Create(context.TODO(), adminBinding)
 		if err != nil {
+			klog.Errorf("creating role binding namespace: %s,role binding: %s, error: %s", namespace.Name, adminBinding.Name, err)
 			return err
 		}
 		found = adminBinding
 	} else if err != nil {
+		klog.Errorf("get role binding namespace: %s,role binding: %s, error: %s", namespace.Name, adminBinding.Name, err)
 		return err
 	}
 
 	if !reflect.DeepEqual(found.RoleRef, adminBinding.RoleRef) {
-		log.Info("Deleting conflict role binding", "namespace", namespace.Name, "name", adminBinding.Name)
 		err = r.Delete(context.TODO(), found)
 		if err != nil {
+			klog.Errorf("deleting role binding namespace: %s, role binding: %s, error: %s", namespace.Name, adminBinding.Name, err)
 			return err
 		}
-		return fmt.Errorf("conflict role binding %s.%s, waiting for recreate", namespace.Name, adminBinding.Name)
+		err = fmt.Errorf("conflict role binding %s.%s, waiting for recreate", namespace.Name, adminBinding.Name)
+		klog.Errorf("conflict role binding namespace: %s, role binding: %s, error: %s", namespace.Name, adminBinding.Name, err)
+		return err
 	}
 
 	if !reflect.DeepEqual(found.Subjects, adminBinding.Subjects) {
 		found.Subjects = adminBinding.Subjects
-		log.Info("Updating role binding", "namespace", namespace.Name, "name", adminBinding.Name)
 		err = r.Update(context.TODO(), found)
 		if err != nil {
+			klog.Errorf("updating role binding namespace: %s, role binding: %s, error: %s", namespace.Name, adminBinding.Name, err)
 			return err
 		}
 	}
@@ -304,17 +311,17 @@ func (r *ReconcileNamespace) checkAndCreateRoleBindings(namespace *corev1.Namesp
 	}
 
 	viewerBinding := &rbac.RoleBinding{}
-	viewerBinding.Name = "viewer"
+	viewerBinding.Name = viewer.Name
 	viewerBinding.Namespace = namespace.Name
-	viewerBinding.RoleRef = rbac.RoleRef{Name: "viewer", APIGroup: "rbac.authorization.k8s.io", Kind: "Role"}
+	viewerBinding.RoleRef = rbac.RoleRef{Name: viewer.Name, APIGroup: "rbac.authorization.k8s.io", Kind: "Role"}
 	viewerBinding.Subjects = workspaceViewerBinding.Subjects
 
 	err = r.Get(context.TODO(), types.NamespacedName{Namespace: namespace.Name, Name: viewerBinding.Name}, found)
 
 	if errors.IsNotFound(err) {
-		log.Info("Creating default role binding", "namespace", namespace.Name, "name", viewerBinding.Name)
 		err = r.Create(context.TODO(), viewerBinding)
 		if err != nil {
+			klog.Errorf("creating role binding namespace: %s, role binding: %s, error: %s", namespace.Name, viewerBinding.Name, err)
 			return err
 		}
 		found = viewerBinding
@@ -323,19 +330,21 @@ func (r *ReconcileNamespace) checkAndCreateRoleBindings(namespace *corev1.Namesp
 	}
 
 	if !reflect.DeepEqual(found.RoleRef, viewerBinding.RoleRef) {
-		log.Info("Deleting conflict role binding", "namespace", namespace.Name, "name", viewerBinding.Name)
 		err = r.Delete(context.TODO(), found)
 		if err != nil {
+			klog.Errorf("deleting conflict role binding namespace: %s, role binding: %s, %s", namespace.Name, viewerBinding.Name, err)
 			return err
 		}
-		return fmt.Errorf("conflict role binding %s.%s, waiting for recreate", namespace.Name, viewerBinding.Name)
+		err = fmt.Errorf("conflict role binding %s.%s, waiting for recreate", namespace.Name, viewerBinding.Name)
+		klog.Errorf("conflict role binding namespace: %s, role binding: %s, error: %s", namespace.Name, viewerBinding.Name, err)
+		return err
 	}
 
 	if !reflect.DeepEqual(found.Subjects, viewerBinding.Subjects) {
 		found.Subjects = viewerBinding.Subjects
-		log.Info("Updating role binding", "namespace", namespace.Name, "name", viewerBinding.Name)
 		err = r.Update(context.TODO(), found)
 		if err != nil {
+			klog.Errorf("updating role binding namespace: %s, role binding: %s, error: %s", namespace.Name, viewerBinding.Name, err)
 			return err
 		}
 	}
@@ -350,20 +359,68 @@ func (r *ReconcileNamespace) checkAndCreateRuntime(namespace *corev1.Namespace) 
 		return nil
 	}
 
-	cm := &corev1.ConfigMap{}
-	configName := fmt.Sprintf("kubeconfig-%s", constants.AdminUserName)
-	err := r.Get(context.TODO(), types.NamespacedName{Namespace: constants.KubeSphereControlNamespace, Name: configName}, cm)
+	openPitrixClient, err := cs.ClientSets().OpenPitrix()
+
+	if _, notEnabled := err.(cs.ClientSetNotEnabledError); notEnabled {
+		return nil
+	} else if err != nil {
+		klog.Error(fmt.Sprintf("create runtime, namespace: %s, error: %s", namespace.Name, err))
+		return err
+	}
+
+	adminKubeConfigName := fmt.Sprintf("kubeconfig-%s", constants.AdminUserName)
+
+	runtimeCredentials, err := openPitrixClient.Runtime().DescribeRuntimeCredentials(openpitrix.SystemContext(), &pb.DescribeRuntimeCredentialsRequest{SearchWord: &wrappers.StringValue{Value: adminKubeConfigName}, Limit: 1})
 
 	if err != nil {
+		klog.Error(fmt.Sprintf("create runtime, namespace: %s, error: %s", namespace.Name, err))
 		return err
 	}
 
-	runtime := &openpitrix.RunTime{Name: namespace.Name, Zone: namespace.Name, Provider: "kubernetes", RuntimeCredential: cm.Data["config"]}
+	var kubesphereRuntimeCredentialId string
 
-	log.Info("Creating openpitrix runtime", "namespace", namespace.Name)
-	if err := openpitrix.Client().CreateRuntime(runtime); err != nil {
+	// runtime credential exist
+	if len(runtimeCredentials.GetRuntimeCredentialSet()) > 0 {
+		kubesphereRuntimeCredentialId = runtimeCredentials.GetRuntimeCredentialSet()[0].GetRuntimeCredentialId().GetValue()
+	} else {
+		adminKubeConfig := corev1.ConfigMap{}
+		err := r.Get(context.TODO(), types.NamespacedName{Namespace: constants.KubeSphereControlNamespace, Name: adminKubeConfigName}, &adminKubeConfig)
+
+		if err != nil {
+			klog.Error(fmt.Sprintf("create runtime, namespace: %s, error: %s", namespace.Name, err))
+			return err
+		}
+
+		resp, err := openPitrixClient.Runtime().CreateRuntimeCredential(openpitrix.SystemContext(), &pb.CreateRuntimeCredentialRequest{
+			Name:                     &wrappers.StringValue{Value: adminKubeConfigName},
+			Provider:                 &wrappers.StringValue{Value: "kubernetes"},
+			Description:              &wrappers.StringValue{Value: "kubeconfig"},
+			RuntimeUrl:               &wrappers.StringValue{Value: "kubesphere"},
+			RuntimeCredentialContent: &wrappers.StringValue{Value: adminKubeConfig.Data["config"]},
+		})
+
+		if err != nil {
+			klog.Error(fmt.Sprintf("create runtime, namespace: %s, error: %s", namespace.Name, err))
+			return err
+		}
+
+		kubesphereRuntimeCredentialId = resp.GetRuntimeCredentialId().GetValue()
+	}
+
+	// TODO runtime id is invalid when recreate runtime
+	runtimeId, err := openPitrixClient.Runtime().CreateRuntime(openpitrix.SystemContext(), &pb.CreateRuntimeRequest{
+		Name:                &wrappers.StringValue{Value: namespace.Name},
+		RuntimeCredentialId: &wrappers.StringValue{Value: kubesphereRuntimeCredentialId},
+		Provider:            &wrappers.StringValue{Value: openpitrix.KubernetesProvider},
+		Zone:                &wrappers.StringValue{Value: namespace.Name},
+	})
+
+	if err != nil {
+		klog.Error(fmt.Sprintf("create runtime, namespace: %s, error: %s", namespace.Name, err))
 		return err
 	}
+
+	klog.V(4).Infof("runtime created successfully, namespace: %s, runtime id: %s", namespace.Name, runtimeId)
 
 	return nil
 }
@@ -372,17 +429,23 @@ func (r *ReconcileNamespace) checkAndCreateRuntime(namespace *corev1.Namespace) 
 func (r *ReconcileNamespace) deleteRuntime(namespace *corev1.Namespace) error {
 
 	if runtimeId := namespace.Annotations[constants.OpenPitrixRuntimeAnnotationKey]; runtimeId != "" {
-		maxRetries := float64(3)
-		for i := float64(0); i < maxRetries; i++ {
-			time.Sleep(time.Duration(i*math.Pow(2, i)) * time.Second)
-			log.Info("Deleting openpitrix runtime", "namespace", namespace.Name, "runtime", runtimeId)
-			err := openpitrix.Client().DeleteRuntime(runtimeId)
 
-			if err == nil || openpitrix.IsNotFound(err) || openpitrix.IsDeleted(err) {
-				return nil
-			}
+		openPitrixClient, err := cs.ClientSets().OpenPitrix()
 
-			log.Error(err, fmt.Sprintf("Deleteing openpitrix runtime failed: %v times left", maxRetries-i-1))
+		if _, notEnabled := err.(cs.ClientSetNotEnabledError); notEnabled {
+			return nil
+		} else if err != nil {
+			klog.Errorf("delete openpitrix runtime: %s, error: %s", runtimeId, err)
+			return err
+		}
+
+		_, err = openPitrixClient.Runtime().DeleteRuntimes(openpitrix.SystemContext(), &pb.DeleteRuntimesRequest{RuntimeId: []string{runtimeId}, Force: &wrappers.BoolValue{Value: true}})
+
+		if err == nil || openpitrix.IsNotFound(err) || openpitrix.IsDeleted(err) {
+			return nil
+		} else {
+			klog.Errorf("delete openpitrix runtime: %s, error: %s", runtimeId, err)
+			return err
 		}
 	}
 
@@ -403,79 +466,23 @@ func (r *ReconcileNamespace) checkAndBindWorkspace(namespace *corev1.Namespace) 
 	err := r.Get(context.TODO(), types.NamespacedName{Name: workspaceName}, workspace)
 
 	if err != nil {
+		// skip if workspace not found
 		if errors.IsNotFound(err) {
-			log.Error(err, fmt.Sprintf("namespace %s bind workspace %s but not found", namespace.Name, workspaceName))
 			return nil
 		}
+		klog.Errorf("bind workspace namespace: %s, workspace: %s, error: %s", namespace.Name, workspaceName, err)
 		return err
 	}
 
 	if !metav1.IsControlledBy(namespace, workspace) {
 		if err := controllerutil.SetControllerReference(workspace, namespace, r.scheme); err != nil {
+			klog.Errorf("bind workspace namespace: %s, workspace: %s, error: %s", namespace.Name, workspaceName, err)
 			return err
 		}
-		log.Info("Bind workspace", "namespace", namespace.Name, "workspace", workspaceName)
 		err = r.Update(context.TODO(), namespace)
 		if err != nil {
+			klog.Errorf("bind workspace namespace: %s, workspace: %s, error: %s", namespace.Name, workspaceName, err)
 			return err
-		}
-	}
-
-	return nil
-}
-
-//Create Ceph secret in the new namespace
-func (r *ReconcileNamespace) checkAndCreateCephSecret(namespace *corev1.Namespace) error {
-
-	newNsName := namespace.Name
-	scList := &v1.StorageClassList{}
-	err := r.List(context.TODO(), &client.ListOptions{}, scList)
-	if err != nil {
-		return err
-	}
-	for _, sc := range scList.Items {
-		if sc.Provisioner == "kubernetes.io/rbd" {
-			log.Info("would create Ceph user secret in storage class %s at namespace %s", sc.GetName(), newNsName)
-			if secretName, ok := sc.Parameters["userSecretName"]; ok {
-				secret := &corev1.Secret{}
-				r.Get(context.TODO(), types.NamespacedName{Namespace: core.NamespaceSystem, Name: secretName}, secret)
-				if err != nil {
-					if errors.IsNotFound(err) {
-						log.Error(err, "cannot find secret in namespace %s, error: %s", core.NamespaceSystem, secretName)
-						continue
-					}
-					log.Error(err, fmt.Sprintf("failed to find secret in namespace %s", core.NamespaceSystem))
-					continue
-				}
-				glog.Infof("succeed to find secret %s in namespace %s", secret.GetName(), secret.GetNamespace())
-
-				newSecret := &corev1.Secret{
-					TypeMeta: metav1.TypeMeta{
-						Kind:       secret.Kind,
-						APIVersion: secret.APIVersion,
-					},
-					ObjectMeta: metav1.ObjectMeta{
-						Name:                       secret.GetName(),
-						Namespace:                  newNsName,
-						Labels:                     secret.GetLabels(),
-						Annotations:                secret.GetAnnotations(),
-						DeletionGracePeriodSeconds: secret.GetDeletionGracePeriodSeconds(),
-						ClusterName:                secret.GetClusterName(),
-					},
-					Data:       secret.Data,
-					StringData: secret.StringData,
-					Type:       secret.Type,
-				}
-				log.Info(fmt.Sprintf("creating secret %s in namespace %s...", newSecret.GetName(), newSecret.GetNamespace()))
-
-				err = r.Create(context.TODO(), newSecret)
-				if err != nil {
-					log.Error(err, fmt.Sprintf("failed to create secret in namespace %s", newSecret.GetNamespace()))
-					continue
-				}
-			} else {
-				log.Error(err, fmt.Sprintf("failed to find user secret name in storage class %s", sc.GetName()))
-			}
 		}
 	}
 
@@ -492,12 +499,12 @@ func (r *ReconcileNamespace) deleteRouter(namespace string) error {
 		if errors.IsNotFound(err) {
 			return nil
 		}
-		log.V(2).Info("get router service failed", err)
+		klog.Error(err)
 	}
 
 	err = r.Delete(context.TODO(), &found)
 	if err != nil {
-		log.Error(err, "delete router failed")
+		klog.Error(err)
 		return err
 	}
 
@@ -508,16 +515,37 @@ func (r *ReconcileNamespace) deleteRouter(namespace string) error {
 		if errors.IsNotFound(err) {
 			return nil
 		}
-		log.V(2).Info("get router deployment failed", err)
+		klog.Error(err)
 		return err
 	}
 
 	err = r.Delete(context.TODO(), &deploy)
 	if err != nil {
-		log.Error(err, "delete router deployment failed")
+		klog.Error(err)
 		return err
 	}
 
 	return nil
 
+}
+
+func (r *ReconcileNamespace) deleteRoleBindings(namespace *corev1.Namespace) error {
+	klog.V(4).Info("deleting role bindings namespace: ", namespace.Name)
+	adminBinding := &rbac.RoleBinding{}
+	adminBinding.Name = admin.Name
+	adminBinding.Namespace = namespace.Name
+	err := r.Delete(context.TODO(), adminBinding)
+	if err != nil && !errors.IsNotFound(err) {
+		klog.Errorf("deleting role binding namespace: %s, role binding: %s,error: %s", namespace.Name, adminBinding.Name, err)
+		return err
+	}
+	viewerBinding := &rbac.RoleBinding{}
+	viewerBinding.Name = viewer.Name
+	viewerBinding.Namespace = namespace.Name
+	err = r.Delete(context.TODO(), viewerBinding)
+	if err != nil && !errors.IsNotFound(err) {
+		klog.Errorf("deleting role binding namespace: %s,role binding: %s,error: %s", namespace.Name, viewerBinding.Name, err)
+		return err
+	}
+	return nil
 }

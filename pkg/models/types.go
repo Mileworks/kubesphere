@@ -96,9 +96,8 @@ type NodeStatus struct {
 }
 
 type HealthStatus struct {
-	KubeSphereComponents []ComponentStatus        `json:"kubesphereStatus" description:"kubesphere components status"`
-	KubernetesComponents []corev1.ComponentStatus `json:"kubernetesStatus" description:"kubernetes components status"`
-	NodeStatus           NodeStatus               `json:"nodeStatus" description:"nodes status"`
+	KubeSphereComponents []ComponentStatus `json:"kubesphereStatus" description:"kubesphere components status"`
+	NodeStatus           NodeStatus        `json:"nodeStatus" description:"nodes status"`
 }
 
 type PodInfo struct {
@@ -107,8 +106,11 @@ type PodInfo struct {
 	Container string `json:"container" description:"container name"`
 }
 
-type Token struct {
-	Token string `json:"access_token" description:"access token"`
+type AuthGrantResponse struct {
+	TokenType    string  `json:"token_type,omitempty"`
+	Token        string  `json:"access_token" description:"access token"`
+	ExpiresIn    float64 `json:"expires_in,omitempty"`
+	RefreshToken string  `json:"refresh_token,omitempty"`
 }
 
 type ResourceQuota struct {
